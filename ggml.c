@@ -153,6 +153,7 @@ void ggml_print_backtrace(void) {
 #define GGML_SILU_FP16
 // #define GGML_CROSS_ENTROPY_EXP_FP16
 // #define GGML_FLASH_ATTN_EXP_FP16
+// #define GGML_SSM_SCAN_EXP_FP16
 
 #define GGML_SOFT_MAX_UNROLL 4
 #define GGML_VEC_DOT_UNROLL  2
@@ -15081,8 +15082,75 @@ static void ggml_compute_forward_ssm_scan_f32(
             s0 = s;
         }
 
+        #ifdef GGML_SIMD
+        int leftover_rows;
+        const int rows_per_step = (GGML_F32_STEP / nc) > 1 ? GGML_F32_STEP / nc : 1;
+        const int nv = nc / GGML_F32_EPR; // vectors per row
+        if (nc % GGML_F32_EPR != 0 || GGML_F32_STEP % nc != 0 || nv < 1 || rows_per_step < 1) {
+            leftover_rows = ir;
+        } else {
+            leftover_rows = ir % rows_per_step;
+
+            // hopefully all SIMD processors give access to enough registers...
+            // Maybe only SSE3 is risky here
+            GGML_F32_VEC ax[GGML_F32_ARR];
+            GGML_F32_VEC ay[GGML_F32_ARR];
+            GGML_F32_VEC az[GGML_F32_ARR];
+            GGML_F32_VEC vdx;
+            float tmp[GGML_F32_EPR]; // TODO: should this be bigger?
+
+            // each iteration is one step (i.e. GGML_F32_STEP elements)
+            for (int is = 0; is < ir - leftover_rows; is += rows_per_step) {
+                for (int irs = 0; irs < rows_per_step; ++irs) {
+                    float sumf = 0.0f;
+                    const int i1 = is + irs;
+                    const float dt_soft_plus = dt[i1] <= 20.0f ? log1pf(expf(dt[i1])) : dt[i1];
+                    const float x_dt = x[i1] * dt_soft_plus;
+                    vdx = GGML_F32_VEC_SET1(x_dt);
+
+                    for (int iv = 0; iv < nv; iv++) {
+                        const int i = iv*GGML_F32_EPR + i1*nc;
+                        const int j = iv + irs*nv;
+
+                        // dA
+                        for (int k = 0; k < GGML_F32_EPR; ++k) {
+#ifndef GGML_SSM_SCAN_EXP_FP16
+                            tmp[k] = expf(dt_soft_plus * A[i + k]);
+#else
+                            float dA_f = dt_soft_plus * A[i + k];
+                            ggml_fp16_t dA = GGML_FP32_TO_FP16(dA_f);
+                            dA_f = GGML_FP16_TO_FP32(ggml_table_exp_f16[dA]);
+                            tmp[k] = dA_f;
+#endif
+                        }
+
+                        ax[j] = GGML_F32_VEC_LOAD(tmp);
+                        ay[j] = GGML_F32_VEC_LOAD(B + iv*GGML_F32_EPR);
+                        az[j] = GGML_F32_VEC_LOAD(s0 + i);
+
+                        // dBx
+                        ay[j] = GGML_F32_VEC_MUL(ay[j], vdx);
+
+                        // state = dBx + dA * s0
+                        ax[j] = GGML_F32_VEC_FMA(ay[j], ax[j], az[j]);
+                        GGML_F32_VEC_STORE(s + i, ax[j]);
+
+                        ay[j] = GGML_F32_VEC_LOAD(C + iv*GGML_F32_EPR);
+                        ay[j] = GGML_F32_VEC_MUL(ay[j], ax[j]);
+                        GGML_F32_VEC_STORE(tmp, ay[j]);
+                        for (int k = 0; k < GGML_F32_EPR; ++k) {
+                            sumf += tmp[k];
+                        }
+                    }
+                    y[i1] = sumf;
+                }
+            }
+        }
+        #else
+        const int leftover_rows = ir;
+        #endif
         // d_inner
-        for (int i1 = 0; i1 < ir; ++i1) {
+        for (int i1 = 0; i1 < leftover_rows; ++i1) {
             // ref: https://github.com/state-spaces/mamba/blob/34076d664838588a3c97727b263478ab9f621a07/mamba_ssm/ops/triton/selective_state_update.py#L78
             float dt_soft_plus = dt[i1] <= 20.0f ? log1pf(expf(dt[i1])) : dt[i1];
             float x_dt = x[i1] * dt_soft_plus;
