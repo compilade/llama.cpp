@@ -2791,6 +2791,54 @@ class MambaModel(Model):
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
+@Model.register("Mamba2ForCausalLM")
+class Mamba2Model(Model):
+    model_arch = gguf.MODEL_ARCH.MAMBA2
+
+    def set_vocab(self):
+        vocab_size = self.hparams["vocab_size"]
+        # Round vocab size to next multiple of 8
+        pad_vocab = self.hparams.get("pad_vocab_size_multiple", 16)
+        # pad using ceiling division
+        # ref: https://stackoverflow.com/a/17511341/22827863
+        vocab_size = -(vocab_size // -pad_vocab) * pad_vocab
+        self.hparams["vocab_size"] = vocab_size
+
+        if (self.dir_model / "tokenizer.json").is_file():
+            self._set_vocab_gpt2()
+        elif (self.dir_model / "tokenizer.model").is_file():
+            self._set_vocab_sentencepiece()
+        elif (self.dir_model / "tokenizer.model.v3").is_file():
+            # mamba-codestral
+            raise NotImplementedError(f"Please rename {self.dir_model / 'tokenizer.model.v3'} to {self.dir_model / 'tokenizer.model'}")
+        else:
+            # Use the GPT-NeoX tokenizer when no tokenizer files are present
+            self._set_vocab_builtin("gpt-neox", vocab_size)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        del bid  # unused
+
+        if name.endswith(".dt_bias"):
+            name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
+
+        new_name = self.map_tensor_name(name)
+
+        if name.endswith(".A_log"):
+            logger.debug("A_log --> A ==> " + new_name)
+            data_torch = -torch.exp(data_torch)
+
+        yield (new_name, data_torch)
+
+    def extra_f32_tensors(self, name: str, new_name: str, bid: int | None, n_dims: int) -> bool:
+        del n_dims  # unused
+
+        return bid is not None and new_name in (
+            self.format_tensor_name(n, bid, ".weight" if name.endswith(".weight") else "") for n in [
+                gguf.MODEL_TENSOR.SSM_CONV1D,
+            ]
+        )
+
+
 @Model.register("CohereForCausalLM")
 class CommandR2Model(Model):
     model_arch = gguf.MODEL_ARCH.COMMAND_R
