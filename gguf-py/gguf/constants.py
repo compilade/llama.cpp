@@ -130,6 +130,7 @@ class Keys:
         INNER_SIZE     = "{arch}.ssm.inner_size"
         STATE_SIZE     = "{arch}.ssm.state_size"
         TIME_STEP_RANK = "{arch}.ssm.time_step_rank"
+        GROUP_COUNT    = "{arch}.ssm.group_count"
 
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
@@ -267,6 +268,7 @@ class MODEL_TENSOR(IntEnum):
     SSM_DT               = auto()
     SSM_A                = auto()
     SSM_D                = auto()
+    SSM_NORM             = auto()
     SSM_OUT              = auto()
     ATTN_Q_A             = auto()
     ATTN_Q_B             = auto()
@@ -396,6 +398,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_DT:               "blk.{bid}.ssm_dt",
     MODEL_TENSOR.SSM_A:                "blk.{bid}.ssm_a",
     MODEL_TENSOR.SSM_D:                "blk.{bid}.ssm_d",
+    MODEL_TENSOR.SSM_NORM:             "blk.{bid}.ssm_norm",
     MODEL_TENSOR.SSM_OUT:              "blk.{bid}.ssm_out",
     MODEL_TENSOR.ATTN_Q_A:             "blk.{bid}.attn_q_a",
     MODEL_TENSOR.ATTN_Q_B:             "blk.{bid}.attn_q_b",
@@ -876,6 +879,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_DT,
         MODEL_TENSOR.SSM_A,
         MODEL_TENSOR.SSM_D,
+        MODEL_TENSOR.SSM_NORM,
         MODEL_TENSOR.SSM_OUT,
     ],
     MODEL_ARCH.XVERSE: [
@@ -1347,6 +1351,7 @@ KEY_SSM_CONV_KERNEL    = Keys.SSM.CONV_KERNEL
 KEY_SSM_INNER_SIZE     = Keys.SSM.INNER_SIZE
 KEY_SSM_STATE_SIZE     = Keys.SSM.STATE_SIZE
 KEY_SSM_TIME_STEP_RANK = Keys.SSM.TIME_STEP_RANK
+KEY_SSM_GROUP_COUNT    = Keys.SSM.GROUP_COUNT
 
 # tokenization
 KEY_TOKENIZER_MODEL      = Keys.Tokenizer.MODEL

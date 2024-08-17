@@ -295,6 +295,9 @@ class Model:
                             gguf.MODEL_TENSOR.FFN_GATE_INP,
                             gguf.MODEL_TENSOR.POS_EMBD,
                             gguf.MODEL_TENSOR.TOKEN_TYPES,
+                            gguf.MODEL_TENSOR.SSM_CONV1D,
+                            gguf.MODEL_TENSOR.SSM_X,
+                            gguf.MODEL_TENSOR.SSM_DT,
                         )
                     )
                     or not name.endswith(".weight")
@@ -2741,7 +2744,7 @@ class MambaModel(Model):
         self.gguf_writer.add_embedding_length(d_model)
         self.gguf_writer.add_feed_forward_length(0) # unused, but seemingly required when loading
         self.gguf_writer.add_head_count(0) # unused, but seemingly required when loading
-        self.gguf_writer.add_block_count(self.hparams["n_layer"])
+        self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_ssm_conv_kernel(d_conv)
         self.gguf_writer.add_ssm_inner_size(d_inner)
         self.gguf_writer.add_ssm_state_size(d_state)
@@ -2773,23 +2776,6 @@ class MambaModel(Model):
 
         return [(new_name, data_torch)]
 
-    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        if bid is not None and new_name in (
-            self.format_tensor_name(
-                n, bid, ".weight" if name.endswith(".weight") else ""
-            )
-            for n in [
-                gguf.MODEL_TENSOR.SSM_CONV1D,
-                gguf.MODEL_TENSOR.SSM_X,
-                gguf.MODEL_TENSOR.SSM_DT,
-                gguf.MODEL_TENSOR.SSM_A,
-                gguf.MODEL_TENSOR.SSM_D,
-            ]
-        ):
-            return gguf.GGMLQuantizationType.F32
-
-        return super().tensor_force_quant(name, new_name, bid, n_dims)
-
 
 @Model.register("Mamba2ForCausalLM")
 class Mamba2Model(Model):
@@ -2797,7 +2783,7 @@ class Mamba2Model(Model):
 
     def set_vocab(self):
         vocab_size = self.hparams["vocab_size"]
-        # Round vocab size to next multiple of 8
+        # Round vocab size to next multiple of 16
         pad_vocab = self.hparams.get("pad_vocab_size_multiple", 16)
         # pad using ceiling division
         # ref: https://stackoverflow.com/a/17511341/22827863
@@ -2815,6 +2801,34 @@ class Mamba2Model(Model):
             # Use the GPT-NeoX tokenizer when no tokenizer files are present
             self._set_vocab_builtin("gpt-neox", vocab_size)
 
+    def set_gguf_parameters(self):
+        d_model = self.find_hparam(["hidden_size", "d_model", "dim"])
+        d_conv  = self.find_hparam(["conv_kernel",       "d_conv"],  optional=True) or 4
+        d_inner = self.find_hparam(["intermediate_size", "d_inner"], optional=True) or 2 * d_model
+        d_state = self.find_hparam(["state_size",        "d_state"], optional=True) or 128
+        head_dim = self.find_hparam(["head_dim"],                    optional=True) or 64
+        n_group = self.find_hparam(["n_groups"],                     optional=True) or 1
+
+        rms_norm_eps = self.find_hparam(["layer_norm_epsilon", "rms_norm_eps"], optional=True) or 1e-5
+
+        # Fail early for models which don't have a block expansion factor of 2
+        # TODO: does this really matter?
+        assert d_inner == 2 * d_model
+        assert d_inner % head_dim == 0
+
+        self.gguf_writer.add_context_length(2**20)  # arbitrary value; for those who use the default
+        self.gguf_writer.add_embedding_length(d_model)
+        self.gguf_writer.add_feed_forward_length(0)  # unused, but seemingly required when loading
+        self.gguf_writer.add_head_count(0)  # unused, but seemingly required when loading
+        self.gguf_writer.add_block_count(self.block_count)
+        self.gguf_writer.add_ssm_conv_kernel(d_conv)
+        self.gguf_writer.add_ssm_inner_size(d_inner)
+        self.gguf_writer.add_ssm_state_size(d_state)
+        self.gguf_writer.add_ssm_time_step_rank(d_inner // head_dim)
+        self.gguf_writer.add_ssm_group_count(n_group)
+        self.gguf_writer.add_layer_norm_rms_eps(rms_norm_eps)
+        self.gguf_writer.add_file_type(self.ftype)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
 
@@ -2828,15 +2842,6 @@ class Mamba2Model(Model):
             data_torch = -torch.exp(data_torch)
 
         yield (new_name, data_torch)
-
-    def extra_f32_tensors(self, name: str, new_name: str, bid: int | None, n_dims: int) -> bool:
-        del n_dims  # unused
-
-        return bid is not None and new_name in (
-            self.format_tensor_name(n, bid, ".weight" if name.endswith(".weight") else "") for n in [
-                gguf.MODEL_TENSOR.SSM_CONV1D,
-            ]
-        )
 
 
 @Model.register("CohereForCausalLM")
