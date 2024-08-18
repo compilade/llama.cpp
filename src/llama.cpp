@@ -9006,8 +9006,8 @@ static struct ggml_tensor * llm_build_mamba(
     const int64_t d_inner = hparams.ssm_d_inner;
     const int64_t d_state = hparams.ssm_d_state;
     const int64_t dt_rank = hparams.ssm_dt_rank;
-    const int64_t n_group = 1;
-    const int64_t n_head  = 1;
+    const int64_t n_head  = d_inner;
+    const int64_t head_dim = 1;
     const int64_t n_seqs  = batch.n_seqs;
 
     const int64_t n_seq_tokens = batch.n_seq_tokens;
@@ -9027,7 +9027,7 @@ static struct ggml_tensor * llm_build_mamba(
     struct ggml_tensor * ssm = llm_build_copy_mask_state(ctx,
             graph, ssm_states_all, state_copy, state_mask,
             hparams.n_embd_v_s(), kv.size, kv_head, n_kv, n_seqs);
-    ssm = ggml_reshape_4d(ctx, ssm, d_state, d_inner, n_head, n_seqs);
+    ssm = ggml_reshape_4d(ctx, ssm, d_state, head_dim, n_head, n_seqs);
 
     // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
     cur = ggml_reshape_3d(ctx, cur, cur->ne[0], n_seq_tokens, n_seqs);
@@ -9072,21 +9072,19 @@ static struct ggml_tensor * llm_build_mamba(
 
     // ssm
     {
-        // {d_inner, n_head, n_seq_tokens, n_seqs}
-        // Mamba-1 only has 1 head
-        x = ggml_reshape_4d(ctx, x, d_inner, n_head, n_seq_tokens, n_seqs);
-
-        // {d_inner, dt_rank + 2*d_state} @ {d_inner, n_head, n_seq_tokens, n_seqs} => {dt_rank + 2*d_state, 1, n_seq_tokens, n_seqs}
+        // {d_inner, dt_rank + 2*d_state} @ {d_inner, n_seq_tokens, n_seqs} => {dt_rank + 2*d_state, n_seq_tokens, n_seqs}
         struct ggml_tensor * x_db = llm_build_lora_mm(lctx, ctx, model.layers[il].ssm_x, x);
         // split
-        struct ggml_tensor * dt = ggml_view_4d(ctx, x_db, dt_rank, n_head, n_seq_tokens, n_seqs, x_db->nb[1], x_db->nb[2], x_db->nb[3], 0);
-        struct ggml_tensor * B  = ggml_view_4d(ctx, x_db, d_state, n_group, n_seq_tokens, n_seqs, x_db->nb[1], x_db->nb[2], x_db->nb[3], ggml_element_size(x_db)*dt_rank);
-        struct ggml_tensor * C  = ggml_view_4d(ctx, x_db, d_state, n_group, n_seq_tokens, n_seqs, x_db->nb[1], x_db->nb[2], x_db->nb[3], ggml_element_size(x_db)*(dt_rank+d_state));
+        struct ggml_tensor * dt = ggml_view_3d(ctx, x_db, dt_rank, n_seq_tokens, n_seqs, x_db->nb[1], x_db->nb[2], 0);
+        struct ggml_tensor * B  = ggml_view_4d(ctx, x_db, d_state, /* n_group */ 1, n_seq_tokens, n_seqs, d_state*x_db->nb[0], x_db->nb[1], x_db->nb[2], ggml_element_size(x_db)*dt_rank);
+        struct ggml_tensor * C  = ggml_view_4d(ctx, x_db, d_state, /* n_group */ 1, n_seq_tokens, n_seqs, d_state*x_db->nb[0], x_db->nb[1], x_db->nb[2], ggml_element_size(x_db)*(dt_rank+d_state));
 
-        // {dt_rank, d_inner} @ {dt_rank, 1, n_seq_tokens, n_seqs} => {d_inner, 1, n_seq_tokens, n_seqs}
+        // {dt_rank, d_inner} @ {dt_rank, n_seq_tokens, n_seqs} => {d_inner, n_seq_tokens, n_seqs}
         dt = llm_build_lora_mm(lctx, ctx, model.layers[il].ssm_dt, dt);
         dt = ggml_add(ctx, dt, model.layers[il].ssm_dt_b);
-        
+
+        x = ggml_reshape_4d(ctx, x, head_dim, n_head, n_seq_tokens, n_seqs);
+
         // Custom operator to optimize the parallel associative scan
         // as described in the Annex D of the Mamba paper.
         // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
@@ -9151,11 +9149,11 @@ static struct ggml_tensor * llm_build_mamba2(
     struct ggml_tensor * conv = llm_build_copy_mask_state(ctx,
             graph, conv_states_all, state_copy, state_mask,
             hparams.n_embd_k_s(), kv.size, kv_head, n_kv, n_seqs);
-    conv = ggml_reshape_3d(ctx, conv, d_conv - 1, d_inner, n_seqs);
+    conv = ggml_reshape_3d(ctx, conv, d_conv - 1, d_inner + 2*n_group*d_state, n_seqs);
     struct ggml_tensor * ssm = llm_build_copy_mask_state(ctx,
             graph, ssm_states_all, state_copy, state_mask,
             hparams.n_embd_v_s(), kv.size, kv_head, n_kv, n_seqs);
-    ssm = ggml_reshape_3d(ctx, ssm, d_state, d_inner, n_seqs);
+    ssm = ggml_reshape_4d(ctx, ssm, d_state, head_dim, n_head, n_seqs);
 
     // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
     cur = ggml_reshape_3d(ctx, cur, cur->ne[0], n_seq_tokens, n_seqs);
@@ -9203,13 +9201,10 @@ static struct ggml_tensor * llm_build_mamba2(
 
     // ssm
     {
-        // {d_inner, n_head, n_seq_tokens, n_seqs}
-        xBC = ggml_reshape_4d(ctx, xBC, d_inner, n_head, n_seq_tokens, n_seqs);
-
         // These correspond to V K Q in SSM/attention duality
-        struct ggml_tensor * x = ggml_view_3d(ctx, xBC, d_inner, xBC->ne[1], xBC->ne[2], xBC->nb[1], xBC->nb[2], 0);
-        struct ggml_tensor * B = ggml_view_3d(ctx, xBC, n_group*d_state, xBC->ne[1], xBC->ne[2], xBC->nb[1], xBC->nb[2], d_inner*ggml_element_size(xBC));
-        struct ggml_tensor * C = ggml_view_3d(ctx, xBC, n_group*d_state, xBC->ne[1], xBC->ne[2], xBC->nb[1], xBC->nb[2], (d_inner + n_group*d_state)*ggml_element_size(xBC));
+        struct ggml_tensor * x = ggml_view_4d(ctx, xBC, head_dim, n_head, n_seq_tokens, n_seqs, head_dim*xBC->nb[0], xBC->nb[1], xBC->nb[2], 0);
+        struct ggml_tensor * B = ggml_view_4d(ctx, xBC, d_state, n_group, n_seq_tokens, n_seqs, d_state*xBC->nb[0], xBC->nb[1], xBC->nb[2], d_inner*ggml_element_size(xBC));
+        struct ggml_tensor * C = ggml_view_4d(ctx, xBC, d_state, n_group, n_seq_tokens, n_seqs, d_state*xBC->nb[0], xBC->nb[1], xBC->nb[2], (d_inner + n_group*d_state)*ggml_element_size(xBC));
 
         // {n_head, n_seq_tokens, n_seqs}
         dt = ggml_add(ctx, dt, model.layers[il].ssm_dt_b);
@@ -9235,19 +9230,17 @@ static struct ggml_tensor * llm_build_mamba2(
 
         // --- end of quadratic naive ssm
 
-        struct ggml_tensor * A = ggml_reshape_2d(ctx, model.layers[il].ssm_a, 1, head_dim);
-
         // TODO: use semistructured matrices to implement ssd
         // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
-        struct ggml_tensor * y_ssm = ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, model.layers[il].ssm_d);
+        struct ggml_tensor * y_ssm = ggml_ssm_scan(ctx, ssm, x, dt, model.layers[il].ssm_a, B, C, model.layers[il].ssm_d);
 
         // store last states
         ggml_build_forward_expand(graph,
             ggml_cpy(ctx,
-                ggml_view_1d(ctx, y_ssm, d_state*d_inner*n_seqs, x->nb[3]*x->ne[3]),
+                ggml_view_1d(ctx, y_ssm, d_state*d_inner*n_seqs, ggml_nelements(x)*x->nb[0]),
                 ggml_view_1d(ctx, ssm_states_all, d_state*d_inner*n_seqs, kv_head*d_state*d_inner*ggml_element_size(ssm_states_all))));
 
-        struct ggml_tensor * y = ggml_view_3d(ctx, y_ssm, d_inner, n_seq_tokens, n_seqs, x->nb[2], x->nb[3], 0);
+        struct ggml_tensor * y = ggml_view_3d(ctx, y_ssm, d_inner, n_seq_tokens, n_seqs, n_head*x->nb[1], n_seq_tokens*n_head*x->nb[1], 0);
 
         // TODO: skip computing output earlier for unused tokens
 
@@ -12926,6 +12919,7 @@ struct llm_build_context {
                     cur = llm_build_mamba2(ctx0, lctx, batch, gf, cur,
                             state_copy, state_mask,
                             kv_head, n_kv, cb, il);
+                    break;
                 case 1:
                 default:
                     cur = llm_build_mamba(ctx0, lctx, batch, gf, cur,
