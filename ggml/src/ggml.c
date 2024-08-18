@@ -15875,7 +15875,7 @@ static void ggml_compute_forward_ssm_scan_f32(
     const int64_t nt = src1->ne[2]; // number of tokens per sequence
     const int64_t ns = src0->ne[3]; // number of sequences in the batch
 
-    const int64_t s_off = ggml_element_size(src0) * ggml_nelements(src0);
+    const int64_t s_off = ggml_element_size(src1) * ggml_nelements(src1);
 
     GGML_ASSERT(ggml_nelements(src1) + ggml_nelements(src0) == ggml_nelements(dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
