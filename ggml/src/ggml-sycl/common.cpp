@@ -51,6 +51,10 @@ void ggml_sycl_host_free(void* ptr) try {
   std::exit(1);
 }
 
+bool gpu_has_xmx(sycl::device &dev) {
+    return dev.has(sycl::aspect::ext_intel_matrix);
+}
+
 int64_t downsample_sycl_global_range(int64_t accumulate_block_num, int64_t block_size) {
   const int64_t max_range = std::numeric_limits<int>::max();
   int64_t sycl_down_blk_size = block_size;
@@ -94,4 +98,21 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+
+void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams) {
+    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+        for (int64_t is = 0; is < GGML_SYCL_MAX_STREAMS; ++is) {
+            if (extra->events[i][is] != nullptr) {
+                SYCL_CHECK(CHECK_TRY_ERROR(dpct::destroy_event(extra->events[i][is])));
+            }
+        }
+        if (extra->data_device[i] != nullptr && streams.size()>0) {
+            ggml_sycl_set_device(i);
+            SYCL_CHECK(
+                CHECK_TRY_ERROR(sycl::free(extra->data_device[i], *(streams[i]))));
+        }
+    }
+    delete extra;
 }
