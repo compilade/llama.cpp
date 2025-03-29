@@ -671,8 +671,12 @@ struct k_heap {
     int mid_k;
     int8_t kmin;
     int8_t kmax;
+    int8_t kmax_step;
     const float * odd;
     const float * steps;
+    // TODO: fixed-size inline array for the indices
+    const uint8_t * indices; // for faster non-linear rounding
+    const int8_t * kvalues;
     struct k_heap_cell * heap;
 };
 
@@ -684,8 +688,8 @@ static void k_heap_build(struct k_heap * heap, int i) {
     int prev_max;
     while (max < n / 2) {
         prev_max = max;
-        int left = 2*(max + 1) - 1;
-        int right = 2*(max + 1);
+        const int left = 2*(max + 1) - 1;
+        const int right = 2*(max + 1);
         if (left < n && heap->heap[left].frac > heap->heap[max].frac) {
             max = left;
         }
@@ -693,7 +697,7 @@ static void k_heap_build(struct k_heap * heap, int i) {
             max = right;
         }
         if (max != prev_max) {
-            struct k_heap_cell tmp = heap->heap[prev_max];
+            const struct k_heap_cell tmp = heap->heap[prev_max];
             heap->heap[prev_max] = heap->heap[max];
             heap->heap[max] = tmp;
         } else {
@@ -704,12 +708,14 @@ static void k_heap_build(struct k_heap * heap, int i) {
 
 // Assuming kvalues is sorted from most negative to most positive.
 // odd and steps are buffers of size k, while heap_cells should be big enough for x later on.
-static void k_heap_init(struct k_heap * GGML_RESTRICT k_heap, int k, const int8_t * GGML_RESTRICT kvalues, struct k_heap_cell * GGML_RESTRICT heap_cells, float * GGML_RESTRICT odd, float * GGML_RESTRICT steps) {
+static void k_heap_init(struct k_heap * GGML_RESTRICT k_heap, int k, const int8_t * GGML_RESTRICT kvalues, struct k_heap_cell * GGML_RESTRICT heap_cells, float * GGML_RESTRICT odd, float * GGML_RESTRICT steps, uint8_t * GGML_RESTRICT indices) {
     GGML_ASSERT(k_heap && kvalues && heap_cells && odd);
     k_heap->n = 0;
     k_heap->k = k;
     k_heap->odd = odd;
     k_heap->steps = steps;
+    k_heap->indices = indices;
+    k_heap->kvalues = kvalues;
     k_heap->heap = heap_cells;
 
     int amin = abs(kvalues[0]);
@@ -730,18 +736,36 @@ static void k_heap_init(struct k_heap * GGML_RESTRICT k_heap, int k, const int8_
     k_heap->mid_k = mid_k;
     k_heap->kmin = kvalues[mid_k];
     k_heap->kmax = kvalues[max_k];
+    k_heap->kmax_step = abs(max_k < mid_k ? kvalues[max_k + 1] - k_heap->kmax : k_heap->kmax - kvalues[max_k - 1]);
 
     for (int i = 0; i < k - 1; ++i) {
         const float threshold = kvalues[i + 1] + kvalues[i];
-        const float step = kvalues[i + 1] - kvalues[i];
+        const float step      = kvalues[i + 1] - kvalues[i];
         // It's amazing how their product is the difference between consecutive squares of the kvalues,
         // but it makes sense because a*a - b*b == (a + b)*(a - b).
         GGML_ASSERT(threshold * step != 0.0f);
-        odd[i + (i >= mid_k ? 1 : 0)] = fabsf(threshold);
+        odd[i + (i >= mid_k ? 1 : 0)]   = fabsf(threshold);
         steps[i + (i >= mid_k ? 1 : 0)] = fabsf(step);
     }
     odd[mid_k] = 0.0f;
     steps[mid_k] = 0.0f;
+
+    {
+        int cur_k = 0;
+        int cur   = (int) kvalues[cur_k] * 2;
+        int next  = (int) kvalues[cur_k + 1] * 2;  // NOTE: this assumes k is at least 2
+        for (int i = -256; i < 254; ++i) {
+            // TODO: is this always correct?
+            if (next != cur && abs(i - next) <= abs(i - cur)) {
+                cur = next;
+                cur_k += 1;
+                if (cur_k < k) {
+                    next = (int) kvalues[cur_k + 1] * 2;
+                }
+            }
+            indices[i + 256] = cur_k;
+        }
+    }
 }
 
 // for linear types which have a constant step of 1 between representable values
@@ -753,11 +777,14 @@ static void k_heap_init_linear(struct k_heap * k_heap, int nmin, int nmax, struc
     k_heap->k = nmax - nmin + 1;
     k_heap->odd = odd;
     k_heap->steps = NULL;
+    k_heap->indices = NULL;
+    k_heap->kvalues = NULL;
     k_heap->heap = heap_cells;
 
     k_heap->mid_k = -nmin;
     k_heap->kmin = 0; // the range should always overlap 0
     k_heap->kmax = abs(nmin) > abs(nmax) ? nmin : nmax;
+    k_heap->kmax_step = 1;
 
     for (int i = nmin; i < nmax; ++i) {
         // odd numbers are the difference between consecutive squares
@@ -809,6 +836,22 @@ static void k_heap_set_x(struct k_heap * k_heap, const float * GGML_RESTRICT x, 
     }
 }
 
+// returns the closest quantized value
+static inline int k_heap_best_index(const struct k_heap * k_heap, float x) {
+    GGML_ASSERT(k_heap->indices);
+    if (x <= -128.0f) {
+        return 0;
+    }
+    if (x >= 127.0f) {
+        return k_heap->k - 1;
+    }
+    // (-256 to 253) --> (0 to 509)
+    // int i = (int)floorf(x) + lroundf(x) + 256;
+    // NOTE: using faster primitives for rounding
+    int i = (int)(x + 128.0f) + nearest_int(x) + 128;
+    return k_heap->indices[i];
+}
+
 // returns the fractions in descending order
 static struct fraction k_heap_pop(struct k_heap * k_heap) {
     if (k_heap && k_heap->n > 0) {
@@ -841,7 +884,7 @@ static struct fraction k_heap_pop(struct k_heap * k_heap) {
                 k_heap->n -= 1;
             }
         } else {
-            if (heap_cell->k_i < k_heap->k - 1) {
+            if (heap_cell->k_i + 1 < k_heap->k) {
                 heap_cell->k_i += 1;
                 heap_cell->frac = heap_cell->x / k_heap->odd[heap_cell->k_i];
             } else {
@@ -861,7 +904,7 @@ static struct fraction k_heap_pop(struct k_heap * k_heap) {
     };
 }
 
-// exhaustive search with cumulative sums
+// incremental search with cumulative sums
 static float make_qkxh_quants(int n, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights, int8_t * GGML_RESTRICT L, int8_t * GGML_RESTRICT Laux, struct k_heap * GGML_RESTRICT k_heap, bool signed_scale) {
     const int nmin = MIN(0, -k_heap->mid_k); // TODO: maybe directly pass these
     const int nmax = MAX(0, k_heap->k + nmin - 1);
@@ -915,13 +958,13 @@ static float make_qkxh_quants(int n, const float * GGML_RESTRICT x, const float 
     if (amax_range > 1) {
         // The smallest non-redundant iscale makes the first clamped value half+1 its max integer value.
         // Proof: anything smaller has a representable vector with values twice as big.
-        // TODO: use a bigger iscale in asymmetric cases when possible
-        // NOTE: strangely, when using half+1, with nmin=-2 and nmax=2, the corners look slighlty clipped,
-        //       but this does not happen when using half of the range as a starting point.
-        const float iscale = ((float)(amax_range >> 1))/amax * (negative_scale ? -1.0f : 1.0f);
+        // But using amax_range - 1 works very well at least with slightly asymmetric quants (e.g. [-8, 7]),
+        // even though it's less exhaustive.
+        const float iscale = ((float)(amax_range - 1))/amax * (negative_scale ? -1.0f : 1.0f);
+        // const float iscale = ((float)(amax_range >> 2))/amax * (negative_scale ? -1.0f : 1.0f);
         for (int i = 0; i < n; ++i) {
             const float w = weights ? weights[i] : x[i] * x[i];
-            int l = MAX(nmin, MIN(lroundf(x[i] * iscale), nmax));
+            int l = MAX(nmin, MIN(nearest_int(x[i] * iscale), nmax));
             Laux[i] = l + k_heap->mid_k;
             suml2 += w * l * l;
             sumlx += w * l * x[i];
@@ -939,10 +982,8 @@ static float make_qkxh_quants(int n, const float * GGML_RESTRICT x, const float 
     k_heap_set_x_L(k_heap, x, Laux, n, negative_scale);
 
     const int imax_range = MAX(abs(nmin), abs(nmax));
-    // const int imax_range = (x[w_amax_i] < 0.0f) != negative_scale ? abs(nmin) : abs(nmax);
     const int max_odd = 2*(imax_range + 1) + 1;
     const float wmax = fabsf(x[w_amax_i]);
-    // const float wmax = amax;
     int best_p_i = -1; // consecutive with 0..n_frac
     for (int i = 0; k_heap->n > 0; ++i) {
         struct fraction frac = k_heap_pop(k_heap);
@@ -1022,11 +1063,13 @@ static float make_qkxsh_quants(int n, int nmin, int nmax, const float * GGML_RES
     int best_i = -1; // consecutive with 0..n_frac
     // Pre-calculate the half-point for the common range.
     // All smaller vectors have a representable vector with twice the values, and thus can be skipped.
+    // But using amax_range - 1 works very well at least with slightly asymmetric quants (e.g. [-8, 7]),
+    // even though it's less exhaustive.
     if (amax_range > 1) {
-        const float iscale = ((float)((amax_range >> 1) + 1))/amax;
+        const float iscale = ((float)(amax_range - 1))/amax;
         for (int i = 0; i < n; ++i) {
             const float w = weights[i];
-            int l = MAX(nmin, MIN(lroundf(x[i] * iscale), nmax));
+            int l = MAX(nmin, MIN(nearest_int(x[i] * iscale), nmax));
             Laux[i] = l + k_heap->mid_k;
             suml2_p += w * l * l;
             sumlx_p += w * l * x[i];
@@ -1133,6 +1176,101 @@ static float make_qkxsh_quants(int n, int nmin, int nmax, const float * GGML_RES
     }
 
     return scale;
+}
+
+// fast cumulative search for non-linear quantization
+static float make_qkxh_nl_fast_quants(int n, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights, int8_t * GGML_RESTRICT L, int8_t * GGML_RESTRICT Laux, struct k_heap * GGML_RESTRICT k_heap, bool signed_scale) {
+    float sumlx = 0.0f;
+    float suml2 = 0.0f;
+    float amax = -1.0f;
+    float w_amax = -1.0f;
+    int amax_i = -1;
+    int w_amax_i = -1;
+    for (int i = 0; i < n; ++i) {
+        const float w = weights ? weights[i] : x[i] * x[i];
+        const float ax = fabsf(x[i]);
+        const float wax = w * ax;
+        if (ax > amax) {
+            amax = ax;
+            amax_i = i;
+        }
+        if (wax > w_amax) {
+            w_amax = wax;
+            w_amax_i = i;
+        }
+    }
+
+    if (amax < GROUP_MAX_EPS) { // all zero
+        memset(L, 0, n);
+        return 0.0f;
+    }
+
+    const bool neg_scale = signed_scale ? (x[amax_i] < 0.0f) != (k_heap->kmax < 0) : false;
+
+    // Start searching with the max at the second last step
+    const int amax_range = abs(k_heap->kmax) - k_heap->kmax_step;
+    // Other starting ranges can be used too.
+    // const int amax_range = abs(k_heap->kvalues[0]) > abs(k_heap->kvalues[k_heap->k - 1]) ?
+    //                            abs(k_heap->kvalues[k_heap->k - 2]) :
+    //                            abs(k_heap->kvalues[1]);
+    const float iscale = amax_range / amax * (neg_scale ? -1.0f : 1.0f);
+    for (int i = 0; i < n; ++i) {
+        const float w = weights ? weights[i] : x[i] * x[i];
+        int l = k_heap_best_index(k_heap, x[i] * iscale);
+        int q = (int) k_heap->kvalues[l];
+        Laux[i] = l;
+        sumlx += w * q * x[i];
+        suml2 += w * q * q;
+    }
+    memcpy(L, Laux, n);
+
+    k_heap_set_x_L(k_heap, x, Laux, n, neg_scale);
+
+    float best;
+    float best_sumlx;
+    float best_suml2;
+    if (suml2 != 0.0f) {
+        best = sumlx * sumlx;
+        best_sumlx = sumlx; // can't change the sign of kmin
+        best_suml2 = suml2;
+    } else {
+        best = 0.0f;
+        best_sumlx = 0.0f;
+        best_suml2 = 1.0f;
+    }
+    const int max_odd = 2 * abs(k_heap->kmax) + (int) k_heap->kmax_step;
+    const float wmax = fabsf(x[w_amax_i]);
+    float sumlx_p = neg_scale ? -sumlx : sumlx;
+    float suml2_p = suml2;
+    int best_p_i = -1; // consecutive with 0..n_frac
+    for (int i = 0; k_heap->n > 0; ++i) {
+        struct fraction frac = k_heap_pop(k_heap);
+        const int ii = frac.i;
+        const float w = weights ? weights[ii] : x[ii] * x[ii];
+        const float v_max_odd = frac.numer * max_odd;
+        if (wmax * frac.denom > v_max_odd) {
+            // stop when the inverse scale would result in clamping the most important value
+            break;
+        }
+        sumlx_p += w * frac.numer;
+        suml2_p += w * frac.denom;
+        const float current = sumlx_p * sumlx_p;
+        Laux[ii] += (x[ii] < 0.0f) != neg_scale ? -1 : 1;
+        if (suml2_p > 0.0f && current * best_suml2 > best * suml2_p) {
+            best = current;
+            best_sumlx = neg_scale ? -sumlx_p : sumlx_p;
+            best_suml2 = suml2_p;
+            if (i == best_p_i + 1) {
+                // reduce copies for consecutive bests
+                L[ii] += (x[ii] < 0.0f) != neg_scale ? -1 : 1;
+            } else {
+                memcpy(L, Laux, n);
+            }
+            best_p_i = i;
+        }
+    }
+
+    return best_suml2 > 0.0f ? best_sumlx / best_suml2 : 0.0f;
 }
 
 // non-linear exhaustive search with cumulative sums
@@ -5327,18 +5465,7 @@ static void quantize_row_iq4_nl_impl(const int super_block_size, const int block
         } else {
             for (int j = 0; j < block_size; ++j) weight[j] = sqrtf(sigma2 + xb[j]*xb[j]);
         }
-        float amax = 0;
-        for (int j = 0; j < block_size; ++j) {
-            float ax = fabsf(xb[j]);
-            if (ax > amax) {
-                amax = ax;
-            }
-        }
-        if (amax < GROUP_MAX_EPS) {
-            scales[ib] = 0;
-            continue;
-        }
-        float d = make_qkxh_nl_quants(block_size, xb, weight, Lb, Laux, k_heap, true, !quant_weights);
+        float d = make_qkxh_nl_fast_quants(block_size, xb, weight, (int8_t *) Lb, (int8_t *) Laux, k_heap, true);
         scales[ib] = d;
         float abs_d = fabsf(d);
         if (abs_d > amax_scale) {
@@ -5384,11 +5511,12 @@ size_t quantize_iq4_nl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     struct k_heap k_heap;
     float odd[16];
     float steps[16];
+    uint8_t indices[510];
     float weight[QK4_NL];
     uint16_t unused_h;
     uint8_t * unused_l = NULL;
     float scale;
-    k_heap_init(&k_heap, 16, kvalues_iq4nl, heap_cells, odd, steps);
+    k_heap_init(&k_heap, 16, kvalues_iq4nl, heap_cells, odd, steps, indices);
     for (int64_t row = 0; row < nrow; ++row) {
         block_iq4_nl * iq4 = (block_iq4_nl *)qrow;
         for (int ibl = 0; ibl < nblock; ++ibl) {
@@ -5412,12 +5540,13 @@ void quantize_row_iq4_nl_ref(const float * GGML_RESTRICT x, block_iq4_nl * GGML_
     struct k_heap k_heap;
     float odd[16];
     float steps[16];
+    uint8_t indices[510];
     float weight[QK4_NL];
     uint16_t unused_h;
     uint8_t * unused_l = NULL;
     float scale;
     block_iq4_nl * iq4 = y;
-    k_heap_init(&k_heap, 16, kvalues_iq4nl, heap_cells, odd, steps);
+    k_heap_init(&k_heap, 16, kvalues_iq4nl, heap_cells, odd, steps, indices);
     for (int ibl = 0; ibl < nblock; ++ibl) {
         quantize_row_iq4_nl_impl(QK4_NL, 32, x + QK4_NL*ibl, &iq4[ibl].d, iq4[ibl].qs, &unused_h, unused_l,
                 &scale, weight, L, Laux, &k_heap, NULL);
@@ -5434,9 +5563,10 @@ size_t quantize_iq4_xs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     struct k_heap k_heap;
     float odd[16];
     float steps[16];
+    uint8_t indices[510];
     float weight[32];
     float scales[QK_K/32];
-    k_heap_init(&k_heap, 16, kvalues_iq4nl, heap_cells, odd, steps);
+    k_heap_init(&k_heap, 16, kvalues_iq4nl, heap_cells, odd, steps, indices);
     for (int64_t row = 0; row < nrow; ++row) {
         block_iq4_xs * iq4 = (block_iq4_xs *)qrow;
         for (int ibl = 0; ibl < nblock; ++ibl) {
