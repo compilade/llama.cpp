@@ -22,105 +22,10 @@ if (
 ):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from gguf.constants import GGMLQuantizationType
-
 from gguf import GGUFReader, ReaderTensor, dequantize
 
 
 logger = logging.getLogger("gguf-diff")
-
-
-_T = TypeVar("_T")
-
-
-def _eq(x: Any, y: Any) -> tuple[Any, ...]:
-    return () if x == y else (x, y)
-
-
-class TensorDiff2:
-    shapes: tuple[tuple[int, ...], tuple[int, ...]]
-    types: tuple[GGMLQuantizationType, GGMLQuantizationType]
-    mean_err: float
-    min_err: float
-    max_err: float
-
-    def __init__(self, tensor1: ReaderTensor, tensor2: ReaderTensor):
-        self.shapes = (tensor1.shape, tensor2.shape)
-        self.types = (tensor1.tensor_type, tensor2.tensor_type)
-        if self.shapes[0] == self.shapes[1]:
-            # TODO: calculate mse, cos
-            pass
-        else:
-            # FIXME: can't calculate error when shapes differ
-            pass
-
-    def __bool__(self) -> bool:
-        return (
-            (self.shapes[0] == self.shapes[1])
-            and (self.types[0] == self.types[1])
-            and (self.max_err == 0)
-        )
-
-
-ShapeDiff: TypeAlias = Tuple[Tuple[int, ...], Tuple[int, ...]]
-TypeDiff: TypeAlias = Tuple[GGMLQuantizationType, GGMLQuantizationType]
-
-
-class Diff2(Generic[_T]):
-    unique: tuple[dict[str, _T], dict[str, _T]]
-    common: dict[str, tuple[_T, _T]]
-    shared: dict[str, _T]
-
-    def __init__(
-        self,
-        a: dict[str, _T],
-        b: dict[str, _T],
-        cmp_eq: Callable[[_T, _T], tuple[Any, ...]] = _eq,
-    ):
-        self.unique = ({}, {})
-        self.common = {}
-        self.shared = {}
-
-        for k, v in a.items():
-            if k in b:
-                u = b[k]
-                if len(cmp_eq(v, u)) == 0:
-                    self.shared[k] = v
-                else:
-                    self.common[k] = (v, u)
-            else:
-                self.unique[0][k] = v
-
-        for k, v in b.items():
-            if k not in a:
-                self.unique[1][k] = v
-
-
-class DiffN(Generic[_T]):
-    pass
-
-
-class GGUFDiff:
-
-    # TODO: how to scale to more than 2 models at a time?
-    #       how to display multi-way diffs?
-    #       Maybe it doesn't need to be multi-way if the main use-case is to compare against a base model.
-    readers: tuple[GGUFReader, GGUFReader]
-    meta_diff: Diff2[Any]
-    tensor_diff: list[TensorDiff2]
-
-    def __init__(self, *readers: GGUFReader) -> None:
-        assert len(readers) == 2, "multi-way diffs are not yet supported"
-        self.readers = readers
-        meta = [
-            {n: v.contents() for n, v in reader.fields.items()} for reader in readers
-        ]
-        self.meta_diff = Diff2(meta[0], meta[1])
-        # FIXME
-        self.tensor_diff = [
-            TensorDiff2(t1, t2)
-            for t1, t2 in zip(readers[0].tensors, readers[1].tensors)
-        ]
 
 
 @dataclass
@@ -152,7 +57,7 @@ def diff_dicts(
 
 
 # min, sum and max normalized squared errors
-# TODO: use less memory
+# TODO: use less memory by streaming the comparison
 def diff_tensors(tensor1: ReaderTensor, tensor2: ReaderTensor) -> NormalizedError:
     # Assuming both tensors have the same shape
     t1 = dequantize(tensor1.data, tensor1.tensor_type)
