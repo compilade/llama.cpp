@@ -33,6 +33,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.scripts]
 gguf-convert-endian = "gguf.scripts:gguf_convert_endian_entrypoint"
+gguf-diff = "gguf.scripts:gguf_diff_entrypoint"
 gguf-dump = "gguf.scripts:gguf_dump_entrypoint"
 gguf-set-metadata = "gguf.scripts:gguf_set_metadata_entrypoint"
 gguf-new-metadata = "gguf.scripts:gguf_new_metadata_entrypoint"

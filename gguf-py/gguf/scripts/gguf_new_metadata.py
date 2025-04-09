@@ -32,11 +32,13 @@ def get_field_data(reader: gguf.GGUFReader, key: str) -> Any:
     return field.contents() if field else None
 
 
-def find_token(token_list: Sequence[int], token: str) -> Sequence[int]:
+def find_token(token_list: Sequence[bytes], token: str | bytes) -> Sequence[int]:
+    if isinstance(token, str):
+        token = token.encode("utf-8")
     token_ids = [index for index, value in enumerate(token_list) if value == token]
 
     if len(token_ids) == 0:
-        raise LookupError(f'Unable to find "{token}" in token list!')
+        raise LookupError(f'Unable to find {token!r} in token list!')
 
     return token_ids
 
@@ -61,7 +63,7 @@ def copy_with_new_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter, new
         val = new_metadata.get(field.name, old_val)
 
         if field.name in new_metadata:
-            logger.debug(f'Modifying {field.name}: "{old_val.value}" -> "{val.value}" {val.description}')
+            logger.debug(f'Modifying {field.name}: {old_val.value!r} -> {val.value!r} {val.description}')
             del new_metadata[field.name]
         elif val.value is not None:
             logger.debug(f'Copying {field.name}')
@@ -157,17 +159,17 @@ def main() -> None:
 
     arch = get_field_data(reader, gguf.Keys.General.ARCHITECTURE)
 
-    token_list = get_field_data(reader, gguf.Keys.Tokenizer.LIST) or []
+    token_list: list[bytes] = get_field_data(reader, gguf.Keys.Tokenizer.LIST) or []
 
     for name, token in args.special_token or []:
         if name not in token_names:
             logger.warning(f'Unknown special token "{name}", ignoring...')
         else:
             ids = find_token(token_list, token)
-            new_metadata[token_names[name]] = MetadataDetails(gguf.GGUFValueType.UINT32, ids[0], f'= {token}')
+            new_metadata[token_names[name]] = MetadataDetails(gguf.GGUFValueType.UINT32, ids[0], f'= {token!r}')
 
             if len(ids) > 1:
-                logger.warning(f'Multiple "{token}" tokens found, choosing ID {ids[0]}, use --special-token-by-id if you want another:')
+                logger.warning(f'Multiple {token!r} tokens found, choosing ID {ids[0]}, use --special-token-by-id if you want another:')
                 logger.warning(', '.join(str(i) for i in ids))
 
     for name, id_string in args.special_token_by_id or []:
@@ -179,7 +181,7 @@ def main() -> None:
             id_int = int(id_string)
 
             if id_int >= 0 and id_int < len(token_list):
-                new_metadata[token_names[name]] = MetadataDetails(gguf.GGUFValueType.UINT32, id_int, f'= {token_list[id_int]}')
+                new_metadata[token_names[name]] = MetadataDetails(gguf.GGUFValueType.UINT32, id_int, f'= {token_list[id_int]!r}')
             else:
                 raise LookupError(f'Token ID {id_int} is not within token list!')
 
