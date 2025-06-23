@@ -30,6 +30,7 @@ string(TOLOWER ${SOC_TYPE} SOC_VERSION) # SOC_VERSION need lower
 string(REGEX MATCH "[0-9]+[a-zA-Z]" SOC_TYPE_MAJOR_SN "${SOC_VERSION}")
 set(SOC_TYPE_COMPILE_OPTION "ASCEND_${SOC_TYPE_MAJOR_SN}")
 string(TOUPPER ${SOC_TYPE_COMPILE_OPTION} SOC_TYPE_COMPILE_OPTION)
+message(STATUS "CANN: SOC_VERSION =  ${SOC_VERSION}")
 
 if (CANN_INSTALL_DIR)
     # Only Support Linux.
@@ -51,13 +52,11 @@ if (CANN_INSTALL_DIR)
         ${CANN_INSTALL_DIR}/acllib/include
     )
 
-    add_subdirectory(kernels)
     list(APPEND CANN_LIBRARIES
         ascendcl
         nnopbase
         opapi
         acl_op_compiler
-        ascendc_kernels
     )
 
     file(GLOB GGML_SOURCES_CANN "*.cpp")

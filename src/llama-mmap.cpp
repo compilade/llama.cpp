@@ -401,7 +401,7 @@ struct llama_mmap::impl {
                 }
             }
 #else
-            throw std::runtime_error("PrefetchVirtualMemory unavailable");
+            LLAMA_LOG_DEBUG("skipping PrefetchVirtualMemory because _WIN32_WINNT < 0x602\n");
 #endif
         }
     }
@@ -476,7 +476,7 @@ struct llama_mlock::impl {
 
         char* errmsg = std::strerror(errno);
         bool suggest = (errno == ENOMEM);
-#if defined(TARGET_OS_VISION) || defined(TARGET_OS_TV)
+#if defined(TARGET_OS_VISION) || defined(TARGET_OS_TV) || defined(_AIX)
         // visionOS/tvOS dont't support RLIMIT_MEMLOCK
         // Skip resource limit checks on visionOS/tvOS
         suggest = false;
