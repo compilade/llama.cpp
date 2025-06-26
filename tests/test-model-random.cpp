@@ -628,6 +628,64 @@ struct model_variant {
                     }
                 }
                 break;
+            case LLM_ARCH_MAMBA2:
+                {
+                    variants.push_back(model_variant(arch, "Mamba2"));
+                    model_variant & cur = variants.back();
+
+                    n_embd = 64;
+
+                    const uint32_t d_inner = 2 * n_embd;
+                    const uint32_t d_conv = 4;
+                    const uint32_t d_state = 128;
+                    const uint32_t n_group = 2;
+                    const uint32_t head_dim = 64;
+                    const uint32_t n_head = d_inner / head_dim;
+                    const int64_t d_in_proj = 2*d_inner + 2*n_group*d_state + n_head;
+
+                    const auto init_A = [](std::mt19937 & rng) {
+                        return -std::uniform_real_distribution<float>(1, 16)(rng);
+                    };
+
+                    cur.add_kv(LLM_KV_CONTEXT_LENGTH, (uint32_t) 1024 * 1024);
+                    cur.add_kv(LLM_KV_EMBEDDING_LENGTH, n_embd);
+                    cur.add_kv(LLM_KV_FEED_FORWARD_LENGTH, (uint32_t) 0);
+                    cur.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, (uint32_t) 0);
+                    cur.add_kv(LLM_KV_BLOCK_COUNT, n_layer);
+                    cur.add_kv(LLM_KV_SSM_CONV_KERNEL, d_conv);
+                    cur.add_kv(LLM_KV_SSM_INNER_SIZE, d_inner);
+                    cur.add_kv(LLM_KV_SSM_STATE_SIZE, d_state);
+                    cur.add_kv(LLM_KV_SSM_TIME_STEP_RANK, n_head);
+                    cur.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
+                    cur.add_kv(LLM_KV_SSM_GROUP_COUNT, n_group);
+
+                    add_tokenizer(cur, n_vocab);
+
+                    cur.add_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab });
+                    cur.add_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd });
+                    cur.add_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab });
+
+                    for (uint32_t i = 0; i < n_layer; ++i) {
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_IN, "weight", i), {n_embd, d_in_proj});
+
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {d_conv, d_inner + 2*n_group*d_state});
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_CONV1D, "bias", i), {d_inner + 2*n_group*d_state}, init_bias);
+
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {n_head}, init_bias);
+
+                        // no "weight" suffix for these
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, init_A);
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_D, i), {1, n_head}, []() { return 1.0f; });
+
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {d_inner / n_group, n_group});
+
+                        // out_proj
+                        cur.add_tensor(tn(LLM_TENSOR_SSM_OUT, "weight", i), {d_inner, n_embd});
+                    }
+                }
+                break;
             case LLM_ARCH_XVERSE:
             case LLM_ARCH_COMMAND_R:
             case LLM_ARCH_COHERE2:
