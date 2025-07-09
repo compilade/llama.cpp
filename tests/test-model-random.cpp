@@ -1096,10 +1096,17 @@ int main(int argc, char ** argv) {
         llama_model_params model_params = llama_model_default_params();
 
         model_params.check_tensors = true;
+        model_params.n_gpu_layers = 999;
 
         llama_model * model = llama_model_load_from_file(tmp_fname.c_str(), model_params);
 
+        llama_model_params ref_model_params = model_params;
+        ref_model_params.n_gpu_layers = 0;
+
+        llama_model * ref_model = llama_model_load_from_file(tmp_fname.c_str(), ref_model_params);
+
         GGML_ASSERT(model);
+        GGML_ASSERT(ref_model);
 
         const auto n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
         // const auto n_embd = llama_model_n_embd(model);
@@ -1136,7 +1143,7 @@ int main(int argc, char ** argv) {
                     ref_params.type_k = GGML_TYPE_F32;
                     ref_params.type_v = GGML_TYPE_F32;
 
-                    llama_context * ref_ctx = llama_init_from_model(model, ref_params);
+                    llama_context * ref_ctx = llama_init_from_model(ref_model, ref_params);
 
                     llama_memory_t mem = llama_get_memory(ref_ctx);
 
@@ -1261,6 +1268,7 @@ int main(int argc, char ** argv) {
                                 // cleanup and exit on first failure
                                 llama_free(ctx);
                                 llama_model_free(model);
+                                llama_model_free(ref_model);
                                 llama_batch_free(batch);
                                 exit(1);
                             }
@@ -1279,6 +1287,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_model_free(model);
+        llama_model_free(ref_model);
     }
 
     return 0;
