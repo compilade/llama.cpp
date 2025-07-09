@@ -570,9 +570,88 @@ struct model_variant {
                         cur.add_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
                         cur.add_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd});
                     }
-                } break;
+                }
+                break;
             case LLM_ARCH_GEMMA3:
+                break;
             case LLM_ARCH_GEMMA3N:
+                {
+                    variants.push_back(model_variant(arch, "Gemma3n"));
+                    model_variant & cur = variants.back();
+
+                    // FIXME: the layer count for gemma3n is somehow hardcoded in the kv cache init
+                    n_layer = 30; // TODO: make it smaller (e.g. 6)
+                    n_embd = 16;
+                    const uint32_t n_head = 4;
+                    const uint32_t n_head_kv = n_head / 2;
+                    const uint32_t n_embd_head_k = n_embd / n_head;
+                    const uint32_t n_embd_k_gqa = n_embd_head_k * n_head_kv;
+                    const uint32_t n_embd_v_gqa = n_embd_k_gqa;
+
+                    // hardcoded in llama-hparams.h (why?)
+                    const uint32_t n_altup      = 4; // altup_num_inputs
+                    const uint32_t laurel_rank  = 64;
+                    const uint32_t n_embd_altup = 256;
+
+                    cur.add_kv(LLM_KV_CONTEXT_LENGTH, n_ctx);
+                    cur.add_kv(LLM_KV_EMBEDDING_LENGTH, n_embd);
+                    cur.add_kv(LLM_KV_BLOCK_COUNT, n_layer);
+                    cur.add_kv(LLM_KV_FEED_FORWARD_LENGTH, n_ff);
+                    cur.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+                    cur.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
+                    cur.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
+                    cur.add_kv(LLM_KV_ATTN_LOGIT_SOFTCAPPING, 50.0f);
+                    cur.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING, 30.0f);
+                    cur.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW, n_ctx / 2); // TODO: use a prime number
+
+                    // FIXME: add keys for n_altup, i_altup_act, laurel_rank, n_embd_altup
+                    //        (why are they hardcoded and not read from the model metadata???)
+
+                    add_tokenizer(cur, n_vocab);
+
+                    cur.add_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+                    cur.add_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {n_embd_altup * n_layer, n_vocab});
+
+                    cur.add_tensor(tn(LLM_TENSOR_ALTUP_PROJ,           "weight"), {n_embd, n_embd, n_altup - 1});
+                    cur.add_tensor(tn(LLM_TENSOR_ALTUP_UNEMBD_PROJ,    "weight"), {n_embd, n_embd, n_altup - 1});
+                    cur.add_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight"), {n_embd, n_embd_altup * n_layer});
+                    cur.add_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight"), {n_embd_altup});
+
+                    cur.add_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+
+                    for (uint32_t i = 0; i < n_layer; ++i) {
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head});
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa});
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd});
+
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head_k});
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head_k});
+                        cur.add_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd});
+
+                        cur.add_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+                        cur.add_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                        cur.add_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd});
+
+                        // altup & laurel
+                        cur.add_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_embd_altup});
+                        cur.add_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_altup, n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_ALTUP_CORRECT_COEF,  "weight", i), {n_altup, n_altup});
+                        cur.add_tensor(tn(LLM_TENSOR_ALTUP_CORRECT_SCALE, "weight", i), {n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_ALTUP_PREDICT_COEF,  "weight", i), {n_altup, n_altup * n_altup});
+                        cur.add_tensor(tn(LLM_TENSOR_ALTUP_ROUTER,        "weight", i), {n_embd, n_altup});
+                        cur.add_tensor(tn(LLM_TENSOR_ALTUP_ROUTER_NORM,   "weight", i), {n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_LAUREL_L,            "weight", i), {n_embd, laurel_rank});
+                        cur.add_tensor(tn(LLM_TENSOR_LAUREL_R,            "weight", i), {laurel_rank, n_embd});
+                        cur.add_tensor(tn(LLM_TENSOR_LAUREL_POST_NORM,    "weight", i), {n_embd});
+                    }
+                }
+                break;
             case LLM_ARCH_STARCODER2:
                 break;
             case LLM_ARCH_MAMBA:
