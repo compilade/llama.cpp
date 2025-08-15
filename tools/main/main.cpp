@@ -220,7 +220,7 @@ int main(int argc, char ** argv) {
                 LOG_WRN("*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?\n");
             }
 
-            LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(chat_templates.get(), params.use_jinja).c_str());
+            LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(chat_templates.get(), params.use_jinja, params.default_template_kwargs).c_str());
         } else {
             LOG_INF("%s: in-suffix/prefix is specified, chat template will be disabled\n", __func__);
         }
@@ -785,14 +785,17 @@ int main(int argc, char ** argv) {
                 }
 
                 // check for reverse prompt using special tokens
-                llama_token last_token = common_sampler_last(smpl);
-                for (auto token : antiprompt_token) {
-                    if (token == last_token) {
-                        if (params.interactive) {
-                            is_interacting = true;
+                // avoid calling common_sampler_last() if last_output is empty
+                if (!last_output.empty()) {
+                    llama_token last_token = common_sampler_last(smpl);
+                    for (auto token : antiprompt_token) {
+                        if (token == last_token) {
+                            if (params.interactive) {
+                                is_interacting = true;
+                            }
+                            is_antiprompt = true;
+                            break;
                         }
-                        is_antiprompt = true;
-                        break;
                     }
                 }
 
@@ -917,10 +920,19 @@ int main(int argc, char ** argv) {
                     embd_inp.insert(embd_inp.end(), line_inp.begin(), line_inp.end());
                     embd_inp.insert(embd_inp.end(), line_sfx.begin(), line_sfx.end());
 
+                    if (params.verbose_prompt) {
+                        LOG_INF("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size() - original_size);
+                    }
+
                     for (size_t i = original_size; i < embd_inp.size(); ++i) {
                         const llama_token token = embd_inp[i];
+                        const std::string token_str = common_token_to_piece(ctx, token);
                         output_tokens.push_back(token);
-                        output_ss << common_token_to_piece(ctx, token);
+                        output_ss << token_str;
+
+                        if (params.verbose_prompt) {
+                            LOG_INF("%6d -> '%s'\n", token, token_str.c_str());
+                        }
                     }
 
                     // reset assistant message
