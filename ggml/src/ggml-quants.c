@@ -910,8 +910,8 @@ struct k_sort {
 
     // These have size k
     const int8_t * k_values;  // if NULL, it's assumed to be linear (i - mid_k)
-    const float *  odd;       // k_values[i + 1] + k_values[i] (odd numbers when linear, hence the name)
-    const float *  step;      // k_values[i + 1] - k_values[i] (if NULL, assumed to be 1)
+    float *  odd;       // k_values[i + 1] + k_values[i] (odd numbers when linear, hence the name)
+    float *  step;      // k_values[i + 1] - k_values[i] (if NULL, assumed to be 1)
 
     // All of the below arrays need to have size n at least.
     int32_t * ids;      // original ids (into the full-precision block)
@@ -933,30 +933,37 @@ struct k_sort {
 
     // For faster non-linear rounding, always 510 bytes in size
     // TODO: static buffer, but how to not include it for non-linear quants?
-    const int8_t * k_indices;
+    int8_t * k_indices;
 };
+
+// helper for k_sort buffer sizes
+#define K_SORT_BUF_SIZE(n, k, range, nl) ( \
+    (/* odd, step */ (k) * (sizeof(float) * (1 + !!(nl)))) + \
+    (/* ids, k_ids, aux_ids, frac, aux */ ((n) * (range)) * (sizeof(int32_t) * 3 + sizeof(float) * 2)) + \
+    (/* Iaux, buckets */ ((n) * (range) * (sizeof(uint16_t) * 2))) + \
+    (/* k_indices */ ((nl) ? 510 * sizeof(int8_t) : 0)) \
+)
+
+// For non-linear quants.
+// k is the number of possible k-values,
+// range is the longest number of k-values starting from the middle one,
+// block is the size of a block.
+#define K_SORT_BUF_SIZE_NL(block, k, range) (K_SORT_BUF_SIZE((block), (k), (range), 1))
+
+// For linear quants. nmin should be <= 0, and nmax >= 0. block is the size of a block.
+#define K_SORT_BUF_SIZE_LINEAR(block, nmin, nmax) (K_SORT_BUF_SIZE((block), (nmax) - (nmin) + 1, (nmax) > -(nmin) ? (nmax) : -(nmin), 0))
 
 // for non-linear quants
 // TODO: maybe use an array of structs instead, or malloc to simplify initialization
-static void k_sort_init(struct k_sort * s, int k, const int8_t * kvalues, float * odd, float * step, int32_t * ids,
-                        int32_t * k_ids, int32_t * aux_ids, float * frac, float * aux, uint16_t * Iaux,
-                        uint16_t * buckets, int8_t * k_indices) {
+static void k_sort_init(struct k_sort * s, int n, int k, const int8_t * kvalues, uint8_t * buf) {
     s->n = 0;
     s->k = k;
 
     s->k_values = kvalues;
-    s->odd      = odd;
-    s->step     = step;
+    s->odd      = (float *) (buf);
+    s->step     = (float *) (buf + k * sizeof(float));
 
-    s->ids     = ids;
-    s->k_ids   = k_ids;
-    s->aux_ids = aux_ids;
-    s->frac    = frac;
-    s->aux_f   = aux;
-    s->Iaux    = Iaux;
-    s->buckets = buckets;
-
-    s->k_indices = k_indices;
+    buf += (2 * k) * sizeof(float);
 
     int k_amin = abs(kvalues[0]);
     int k_amax = abs(kvalues[0]);
@@ -967,15 +974,33 @@ static void k_sort_init(struct k_sort * s, int k, const int8_t * kvalues, float 
         if (ak < k_amin) { k_amin = ak; mid_k = i; }
         if (ak > k_amax) { k_amax = ak; max_k = i; }
     }
+
+    const int max_range = (mid_k > (k - mid_k - 1)) ? mid_k : k - mid_k - 1;
+
+    s->ids     = (int32_t *) (buf + max_range * n * (sizeof(int32_t) * 0));
+    s->k_ids   = (int32_t *) (buf + max_range * n * (sizeof(int32_t) * 1));
+    s->aux_ids = (int32_t *) (buf + max_range * n * (sizeof(int32_t) * 2));
+    s->frac    = (float *) (buf + max_range * n * (sizeof(int32_t) * 3));
+    s->aux_f   = (float *) (buf + max_range * n * (sizeof(int32_t) * 3 + sizeof(float)));
+
+    buf += max_range * n * (sizeof(int32_t) * 3 + sizeof(float) * 2);
+
+    s->Iaux    = (uint16_t *) (buf);
+    s->buckets = (uint16_t *) (buf + n * max_range * sizeof(uint16_t));
+
+    buf += 2 * n * max_range * sizeof(uint16_t);
+
+    s->k_indices = (int8_t *) buf;
+
     for (int i = 1; i < k; ++i) {
         // 0 to k - 1, skipping mid_k
         const int j = i - ((int) (i <= mid_k));
 
-        odd[j]  = abs(kvalues[i] + kvalues[i - 1]);
-        step[j] = abs(kvalues[i] - kvalues[i - 1]);
+        s->odd[j]  = abs(kvalues[i] + kvalues[i - 1]);
+        s->step[j] = abs(kvalues[i] - kvalues[i - 1]);
     }
-    odd[mid_k]  = 1.0f;
-    step[mid_k] = 1.0f;
+    s->odd[mid_k]  = 1.0f;
+    s->step[mid_k] = 1.0f;
 
     s->kmin  = kvalues[mid_k];
     s->kmax  = kvalues[max_k];
@@ -991,20 +1016,21 @@ static void k_sort_init(struct k_sort * s, int k, const int8_t * kvalues, float 
             if (next != cur && abs(i - next) <= abs(i - cur)) {
                 cur = next;
                 cur_k += 1;
-                if (cur_k < k) {
+                if (cur_k + 1 < k) {
                     next = (int) kvalues[cur_k + 1] * 2;
                 }
             }
-            k_indices[i + 256] = cur_k;
+            s->k_indices[i + 256] = cur_k;
         }
     }
 }
 
-// TODO: maybe use an array of structs instead, or malloc to simplify initialization
-static void k_sort_init_linear(struct k_sort * s, int nmin, int nmax, float * odd, int32_t * ids, int32_t * k_ids,
-                               int32_t * aux_ids, float * frac, float * aux, uint16_t * Iaux, uint16_t * buckets) {
+// buf should have size from K_SORT_BUF_SIZE_LINEAR(n, nmin, nmax)
+static void k_sort_init_linear(struct k_sort * s, int n, int nmin, int nmax, uint8_t * buf) {
     nmin = MIN(0, nmin);
     nmax = MAX(0, nmax);
+
+    const int max_range = (nmax > -nmin ? nmax : -nmin);
 
     s->n     = 0;
     s->k     = nmax - nmin + 1;
@@ -1013,25 +1039,30 @@ static void k_sort_init_linear(struct k_sort * s, int nmin, int nmax, float * od
     s->kmax  = -nmin > nmax ? nmin : nmax;
 
     s->k_values = NULL;
-    s->odd      = odd;
+    s->odd      = (float *) (buf);
     s->step     = NULL;
 
-    s->ids     = ids;
-    s->k_ids   = k_ids;
-    s->aux_ids = aux_ids;
-    s->frac    = frac;
-    s->aux_f   = aux;
-    s->Iaux    = Iaux;
-    s->buckets = buckets;
+    buf += s->k * sizeof(float);
+
+    s->ids     = (int32_t *) (buf + max_range * n * (sizeof(int32_t) * 0));
+    s->k_ids   = (int32_t *) (buf + max_range * n * (sizeof(int32_t) * 1));
+    s->aux_ids = (int32_t *) (buf + max_range * n * (sizeof(int32_t) * 2));
+    s->frac    = (float *) (buf + max_range * n * (sizeof(int32_t) * 3));
+    s->aux_f   = (float *) (buf + max_range * n * (sizeof(int32_t) * 3 + sizeof(float)));
+
+    buf += max_range * n * (sizeof(int32_t) * 3 + sizeof(float) * 2);
+
+    s->Iaux    = (uint16_t *) (buf);
+    s->buckets = (uint16_t *) (buf + n * max_range * sizeof(uint16_t));
 
     s->k_indices = NULL;
 
     for (int i = nmin; i < nmax; ++i) {
-        const int j = i - nmin + ((int) (i >= 0));
+        const int j = i - nmin + (i >= 0);
 
-        odd[j] = abs(i + (i + 1));
+        s->odd[j] = abs(i + (i + 1));
     }
-    odd[-nmin] = 1.0f;
+    s->odd[-nmin] = 1.0f;
 }
 
 static inline int k_sort_best_index(struct k_sort * s, float x) {
@@ -1127,7 +1158,7 @@ static void k_sort_set_x_L(struct k_sort * s, int n, int w_amax_i, const float *
                            const int8_t * GGML_RESTRICT L, bool negative_scale) {
     const float wmax = fabsf(x[w_amax_i]);
     const int k = s->k;
-    // Extrapolate (assuming k is at least 2)
+    // Extrapolate the extremities (assuming k is at least 2)
     const float max_odd = (x[w_amax_i] < 0.0f) != negative_scale ? s->odd[0] + fabsf(s->odd[0] - s->odd[1]) :
                                                                  s->odd[k - 1] + fabsf(s->odd[k - 1] - s->odd[k - 2]);
     int m = 0;
@@ -1177,6 +1208,7 @@ static float make_qkxs_quants(int n, const float * restrict x, const float * res
         if (wax > w_amax) { w_amax = wax; w_amax_i = i; }
     }
 
+    // TODO: less arbitrary threshold
     if (amax < GROUP_MAX_EPS) { // all zero
         memset(L, 0, n);
         return 0.0f;
@@ -1262,6 +1294,7 @@ static float make_qkxs_quants(int n, const float * restrict x, const float * res
     return best_denom > 0.0f ? best_numer / best_denom : 0.0f;
 }
 
+// TODO: remove this, heap sort is slow
 // incremental search with cumulative sums
 static float make_qkxh_quants(int n, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights, int8_t * GGML_RESTRICT L, int8_t * GGML_RESTRICT Laux, struct k_heap * GGML_RESTRICT k_heap, bool signed_scale) {
     const int nmin = MIN(0, -k_heap->mid_k); // TODO: maybe directly pass these
@@ -1378,6 +1411,7 @@ static float make_qkxh_quants(int n, const float * GGML_RESTRICT x, const float 
     return scale;
 }
 
+// TODO: remove this, heap sort is slow
 // like make_qkxh_quants, but doesn't assume the sign of the scale is the sign of the absmax value
 static float make_qkxsh_quants(int n, int nmin, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights, int8_t * GGML_RESTRICT L, int8_t * GGML_RESTRICT Laux, struct k_heap * GGML_RESTRICT k_heap) {
     nmin = MIN(0, nmin);
@@ -1536,6 +1570,7 @@ static float make_qkxsh_quants(int n, int nmin, int nmax, const float * GGML_RES
     return scale;
 }
 
+// TODO: remove this, heap sort is slow
 // fast cumulative search for non-linear quantization
 static float make_qkxh_nl_fast_quants(int n, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights, int8_t * GGML_RESTRICT L, int8_t * GGML_RESTRICT Laux, struct k_heap * GGML_RESTRICT k_heap, bool signed_scale) {
     float sumlx = 0.0f;
@@ -1631,6 +1666,7 @@ static float make_qkxh_nl_fast_quants(int n, const float * GGML_RESTRICT x, cons
     return best_suml2 > 0.0f ? best_sumlx / best_suml2 : 0.0f;
 }
 
+// TODO: remove this, heap sort is slow
 // non-linear (nearly) exhaustive search with cumulative sums
 static float make_qkxh_nl_quants(int n, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights, uint8_t * GGML_RESTRICT L, uint8_t * GGML_RESTRICT Laux, struct k_heap * GGML_RESTRICT k_heap, bool signed_scale, bool fast) {
     float sumlx = 0.0f;
@@ -2125,6 +2161,11 @@ static void quantize_row_q2_K_impl(const float * GGML_RESTRICT x, block_q2_K * G
     float weight[16];
     uint8_t Ls[QK_K/16], Lm[QK_K/16];
 
+    struct k_sort k_sort;
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK_K/16, 0, 15)];
+
+    k_sort_init_linear(&k_sort, QK_K/16, 0, 15, k_buf);
+
     for (int i = 0; i < nb; i++) {
         memset(sw, 0, QK_K/16*sizeof(float));
         float sumx2 = 0;
@@ -2138,8 +2179,10 @@ static void quantize_row_q2_K_impl(const float * GGML_RESTRICT x, block_q2_K * G
         }
 
         float dm, mm;
-        dm  = make_qp_quants(QK_K/16, 15, scales, Ls, sw);
-        mm  = make_qp_quants(QK_K/16, 15, mins,   Lm, sw);
+        dm  = make_qkxs_quants(QK_K/16, scales, sw, (int8_t *) Ls, (int8_t *) Laux, &k_sort, false, true);
+        mm  = make_qkxs_quants(QK_K/16, mins, sw, (int8_t *) Lm, (int8_t *) Laux, &k_sort, false, true);
+        // dm  = make_qp_quants(QK_K/16, 15, scales, Ls, sw);
+        // mm  = make_qp_quants(QK_K/16, 15, mins,   Lm, sw);
 
         y[i].d    = GGML_FP32_TO_FP16(dm);
         y[i].dmin = GGML_FP32_TO_FP16(mm);
@@ -2150,6 +2193,7 @@ static void quantize_row_q2_K_impl(const float * GGML_RESTRICT x, block_q2_K * G
             y[i].scales[j] = Ls[j] | (Lm[j] << 4);
         }
 
+        // TODO: avoid requant
         if (requantize) {
             for (int j = 0; j < QK_K/16; ++j) {
                 const float d = dm * (y[i].scales[j] & 0xF);
@@ -2200,17 +2244,9 @@ void quantize_row_q3_K_ref(const float * GGML_RESTRICT x, block_q3_K * GGML_REST
     float scales[QK_K / 16];
     float weights[16];
     struct k_sort k_sort;
-    // Need (sub-block size)*MAX(abs(nmin), abs(nmax))
-    float odd[8];
-    int32_t ids[16*4];
-    int32_t k_ids[16*4];
-    int32_t aux_ids[16*4];
-    float frac[16*4];
-    float aux[16*4];
-    uint16_t Iaux[16*4];
-    uint16_t buckets[16*4];
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(16, -4, 3)];
 
-    k_sort_init_linear(&k_sort, -4, 3, odd, ids, k_ids, aux_ids, frac, aux, Iaux, buckets);
+    k_sort_init_linear(&k_sort, 16, -4, 3, k_buf);
 
     for (int i = 0; i < 16; ++i) {
         weights[i] = 1.0f;
@@ -2331,27 +2367,12 @@ static void quantize_row_q3_K_impl(const float * GGML_RESTRICT x, block_q3_K * G
     float sw[QK_K / 16];
     int8_t Ls[QK_K / 16];
     struct k_sort k_sort;
-    float odd[8];
-    // Need (sub-block size)*MAX(abs(nmin), abs(nmax))
-    int32_t ids[16*4];
-    int32_t k_ids[16*4];
-    int32_t aux_ids[16*4];
-    float frac[16*4];
-    float aux[16*4];
-    uint16_t Iaux[16*4];
-    uint16_t buckets[16*4];
     struct k_sort k_sort_s;
-    float odd_s[64];
-    int32_t ids_s[(QK_K / 16) * 32];
-    int32_t k_ids_s[(QK_K / 16) * 32];
-    int32_t aux_ids_s[(QK_K / 16) * 32];
-    float frac_s[(QK_K / 16) * 32];
-    float aux_s[(QK_K / 16) * 32];
-    uint16_t Iaux_s[(QK_K / 16) * 32];
-    uint16_t buckets_s[(QK_K / 16) * 32];
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(16, -4, 3)];
+    uint8_t k_buf_s[K_SORT_BUF_SIZE_LINEAR(QK_K / 16, -32, 31)];
 
-    k_sort_init_linear(&k_sort, -4, 3, odd, ids, k_ids, aux_ids, frac, aux, Iaux, buckets);
-    k_sort_init_linear(&k_sort_s, -32, 31, odd_s, ids_s, k_ids_s, aux_ids_s, frac_s, aux_s, Iaux_s, buckets_s);
+    k_sort_init_linear(&k_sort, 16, -4, 3, k_buf);
+    k_sort_init_linear(&k_sort_s, QK_K / 16, -32, 31, k_buf_s);
 
     for (int i = 0; i < nb; i++) {
 
@@ -2479,6 +2500,7 @@ void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_REST
         y[i].d = GGML_FP32_TO_FP16(max_scale/63.f);
         y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
 
+        // TODO: avoid requant
         uint8_t sc, m;
         for (int j = 0; j < QK_K/32; ++j) {
             get_scale_min_k4(j, y[i].scales, &sc, &m);
@@ -2538,6 +2560,10 @@ static void quantize_row_q4_K_impl(const float * GGML_RESTRICT x, block_q4_K * G
     float   sw[QK_K/32];
     float   mins[QK_K/32];
     float   scales[QK_K/32];
+    struct k_sort k_sort;
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK_K/32, 0, 63)];
+
+    k_sort_init_linear(&k_sort, QK_K/32, 0, 63, k_buf);
 
     for (int i = 0; i < nb; i++) {
 
@@ -2559,8 +2585,11 @@ static void quantize_row_q4_K_impl(const float * GGML_RESTRICT x, block_q4_K * G
             scales[j] = make_qkx3_quants(32, 15, x + 32*j, weights, L + 32*j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
         }
 
-        float d_block = make_qp_quants(QK_K/32, 63, scales, Ls, sw);
-        float m_block = make_qp_quants(QK_K/32, 63, mins,   Lm, sw);
+        float d_block = make_qkxs_quants(QK_K/32, scales, sw, (int8_t *) Ls, (int8_t *) Laux, &k_sort, false, true);
+        float m_block = make_qkxs_quants(QK_K/32, mins,   sw, (int8_t *) Lm, (int8_t *) Laux, &k_sort, false, true);
+
+        // float d_block = make_qp_quants(QK_K/32, 63, scales, Ls, sw);
+        // float m_block = make_qp_quants(QK_K/32, 63, mins,   Lm, sw);
         for (int j = 0; j < QK_K/32; ++j) {
             uint8_t ls = Ls[j];
             uint8_t lm = Lm[j];
@@ -2576,6 +2605,7 @@ static void quantize_row_q4_K_impl(const float * GGML_RESTRICT x, block_q4_K * G
         y[i].d = GGML_FP32_TO_FP16(d_block);
         y[i].dmin = GGML_FP32_TO_FP16(m_block);
 
+        // TODO: avoid requant
         uint8_t sc, m;
         for (int j = 0; j < QK_K/32; ++j) {
             get_scale_min_k4(j, y[i].scales, &sc, &m);
@@ -2666,6 +2696,7 @@ void quantize_row_q5_K_ref(const float * GGML_RESTRICT x, block_q5_K * GGML_REST
         y[i].d = GGML_FP32_TO_FP16(max_scale/63.f);
         y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
 
+        // TODO: avoid requant
         uint8_t sc, m;
         for (int j = 0; j < QK_K/32; ++j) {
             get_scale_min_k4(j, y[i].scales, &sc, &m);
@@ -2743,6 +2774,10 @@ static void quantize_row_q5_K_impl(const float * GGML_RESTRICT x, block_q5_K * G
     float   scales[QK_K/32];
     float   sw[QK_K/32];
     float   weights[32];
+    struct k_sort k_sort;
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK_K/32, 0, 63)];
+
+    k_sort_init_linear(&k_sort, QK_K/32, 0, 63, k_buf);
 
     for (int i = 0; i < nb; i++) {
 
@@ -2765,8 +2800,10 @@ static void quantize_row_q5_K_impl(const float * GGML_RESTRICT x, block_q5_K * G
             scales[j] = make_qkx3_quants(32, 31, x + 32*j, weights, L + 32*j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
         }
 
-        float d_block = make_qp_quants(QK_K/32, 63, scales, Ls, sw);
-        float m_block = make_qp_quants(QK_K/32, 63, mins,   Lm, sw);
+        float d_block = make_qkxs_quants(QK_K/32, scales, sw, (int8_t *) Ls, (int8_t *) Laux, &k_sort, false, true);
+        float m_block = make_qkxs_quants(QK_K/32, mins,   sw, (int8_t *) Lm, (int8_t *) Laux, &k_sort, false, true);
+        // float d_block = make_qp_quants(QK_K/32, 63, scales, Ls, sw);
+        // float m_block = make_qp_quants(QK_K/32, 63, mins,   Lm, sw);
 
         for (int j = 0; j < QK_K/32; ++j) {
             uint8_t ls = Ls[j];
@@ -2785,6 +2822,7 @@ static void quantize_row_q5_K_impl(const float * GGML_RESTRICT x, block_q5_K * G
         y[i].d = GGML_FP32_TO_FP16(d_block);
         y[i].dmin = GGML_FP32_TO_FP16(m_block);
 
+        // TODO: avoid requant
         uint8_t sc, m;
         for (int j = 0; j < QK_K/32; ++j) {
             get_scale_min_k4(j, y[i].scales, &sc, &m);
@@ -2847,7 +2885,14 @@ void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_REST
     const int64_t nb = k / QK_K;
 
     int8_t L[QK_K];
-    float   scales[QK_K/16];
+    int8_t Laux[16];
+    float  scales[QK_K/16];
+    float  weights[16];
+
+    struct k_sort k_sort;
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(16, -32, 31)];
+
+    k_sort_init_linear(&k_sort, 16, -32, 31, k_buf);
 
     for (int i = 0; i < nb; i++) {
 
@@ -2855,8 +2900,12 @@ void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_REST
         float max_abs_scale = 0;
 
         for (int ib = 0; ib < QK_K/16; ++ib) {
+            for (int j = 0; j < 16; ++j) {
+                weights[j] = x[16*ib + j] * x[16*ib + j];
+            }
 
-            const float scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, NULL);
+            const float scale = make_qkxs_quants(16, x + 16*ib, weights, L + 16*ib, Laux, &k_sort, true, true);
+            // const float scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, NULL);
             scales[ib] = scale;
 
             const float abs_scale = fabsf(scale);
@@ -2880,6 +2929,7 @@ void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_REST
             y[i].scales[ib] = MIN(127, nearest_int(iscale*scales[ib]));
         }
 
+        // TODO: avoid requant
         for (int j = 0; j < QK_K/16; ++j) {
             float d = GGML_FP16_TO_FP32(y[i].d) * y[i].scales[j];
             if (!d) {
@@ -2948,8 +2998,14 @@ static void quantize_row_q6_K_impl(const float * GGML_RESTRICT x, block_q6_K * G
     const int64_t nb = n_per_row / QK_K;
 
     int8_t L[QK_K];
-    float   scales[QK_K/16];
-    //float   weights[16];
+    int8_t Laux[16];
+    float  scales[QK_K/16];
+    float  weights[16];
+
+    struct k_sort k_sort;
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(16, -32, 31)];
+
+    k_sort_init_linear(&k_sort, 16, -32, 31, k_buf);
 
     for (int i = 0; i < nb; i++) {
 
@@ -2967,9 +3023,14 @@ static void quantize_row_q6_K_impl(const float * GGML_RESTRICT x, block_q6_K * G
                 const float * qw = quant_weights + QK_K*i + 16*ib;
                 //for (int j = 0; j < 16; ++j) weights[j] = qw[j] * sqrtf(sigma2 + x[16*ib + j]*x[16*ib + j]);
                 //scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, weights);
-                scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, qw);
+                scale = make_qkxs_quants(16, x + 16*ib, qw, L + 16*ib, Laux, &k_sort, true, true);
             } else {
-                scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, NULL);
+                for (int j = 0; j < 16; ++j) {
+                    weights[j] = x[16*ib + j] * x[16*ib + j];
+                }
+
+                // scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, NULL);
+                scale = make_qkxs_quants(16, x + 16*ib, weights, L + 16*ib, Laux, &k_sort, true, true);
             }
             scales[ib] = scale;
 
@@ -2994,6 +3055,7 @@ static void quantize_row_q6_K_impl(const float * GGML_RESTRICT x, block_q6_K * G
             y[i].scales[ib] = MIN(127, nearest_int(iscale*scales[ib]));
         }
 
+        // TODO: avoid requant
         for (int j = 0; j < QK_K/16; ++j) {
             float d = GGML_FP16_TO_FP32(y[i].d) * y[i].scales[j];
             if (!d) {
@@ -3055,16 +3117,9 @@ static void quantize_row_q4_0_impl(const float * GGML_RESTRICT x, block_q4_0 * G
     int8_t L[QK4_0];
     int8_t Laux[QK4_0];
     struct k_sort k_sort;
-    float odd[16];
-    int32_t ids[QK4_0 * 8];
-    int32_t k_ids[QK4_0 * 8];
-    int32_t aux_ids[QK4_0 * 8];
-    float frac[QK4_0 * 8];
-    float aux[QK4_0 * 8];
-    uint16_t Iaux[QK4_0 * 8];
-    uint16_t buckets[QK4_0 * 8];
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK4_0, -8, 7)];
 
-    k_sort_init_linear(&k_sort, -8, 7, odd, ids, k_ids, aux_ids, frac, aux, Iaux, buckets);
+    k_sort_init_linear(&k_sort, QK4_0, -8, 7, k_buf);
 
     float sum_x2 = 0;
     for (int j = 0; j < n_per_row; ++j) sum_x2 += x[j]*x[j];
@@ -3155,16 +3210,9 @@ static void quantize_row_q5_0_impl(const float * GGML_RESTRICT x, block_q5_0 * G
     int8_t L[QK5_0];
     int8_t Laux[QK5_0];
     struct k_sort k_sort;
-    float odd[32];
-    int32_t ids[QK5_0 * 16];
-    int32_t k_ids[QK5_0 * 16];
-    int32_t aux_ids[QK5_0 * 16];
-    float frac[QK5_0 * 16];
-    float aux[QK5_0 * 16];
-    uint16_t Iaux[QK5_0 * 16];
-    uint16_t buckets[QK5_0 * 16];
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK5_0, -16, 15)];
 
-    k_sort_init_linear(&k_sort, -16, 15, odd, ids, k_ids, aux_ids, frac, aux, Iaux, buckets);
+    k_sort_init_linear(&k_sort, QK5_0, -16, 15, k_buf);
 
     float sum_x2 = 0;
     for (int j = 0; j < n_per_row; ++j) sum_x2 += x[j]*x[j];
@@ -3347,16 +3395,9 @@ static void quantize_row_tq1_0_impl(const float * GGML_RESTRICT x, block_tq1_0 *
     int8_t L[QK_K];
     int8_t Laux[QK_K];
     struct k_sort k_sort;
-    float odd[3];
-    int32_t ids[QK_K * 1];
-    int32_t k_ids[QK_K * 1];
-    int32_t aux_ids[QK_K * 1];
-    float frac[QK_K * 1];
-    float aux[QK_K * 1];
-    uint16_t Iaux[QK_K * 1];
-    uint16_t buckets[QK_K * 1];
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK_K, -1, 1)];
 
-    k_sort_init_linear(&k_sort, -1, 1, odd, ids, k_ids, aux_ids, frac, aux, Iaux, buckets);
+    k_sort_init_linear(&k_sort, QK_K, -1, 1, k_buf);
 
     float sum_x2 = 0;
     for (int j = 0; j < n_per_row; ++j) { sum_x2 += x[j]*x[j]; }
@@ -3457,11 +3498,10 @@ static void quantize_row_tq2_0_impl(const float * GGML_RESTRICT x, block_tq2_0 *
     float weight[QK_K];
     int8_t L[QK_K];
     int8_t Laux[QK_K];
-    struct k_heap_cell heap_cells[QK_K];
-    float odd[4 + 1];
-    struct k_heap k_heap;
+    struct k_sort k_sort;
+    uint8_t k_buf[K_SORT_BUF_SIZE_LINEAR(QK_K, -1, 2)];
 
-    k_heap_init_linear(&k_heap, -2, 2, heap_cells, odd);
+    k_sort_init_linear(&k_sort, QK_K, -1, 2, k_buf);
 
     float sum_x2 = 0;
     for (int j = 0; j < n_per_row; ++j) { sum_x2 += x[j]*x[j]; }
@@ -3472,7 +3512,7 @@ static void quantize_row_tq2_0_impl(const float * GGML_RESTRICT x, block_tq2_0 *
         const float * xb = x + QK_K * ib;
         const float * qw = quant_weights + QK_K * ib;
         for (int j = 0; j < QK_K; ++j) { weight[j] = qw[j] * sqrtf(sigma2 + xb[j]*xb[j]); }
-        float d = make_qkxsh_quants(QK_K, -1, 2, xb, weight, L, Laux, &k_heap);
+        float d = make_qkxs_quants(QK_K, xb, weight, L, Laux, &k_sort, true, false);
         y[ib].d = GGML_FP32_TO_FP16(d);
 
         for (size_t j = 0; j < sizeof(y->qs); j += 32) {
@@ -6016,21 +6056,12 @@ size_t quantize_iq4_nl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     uint8_t L[QK4_NL];
     uint8_t Laux[QK4_NL];
     struct k_sort k_sort;
-    float odd[16];
-    float step[16];
-    int32_t ids[QK4_NL * 8];
-    int32_t k_ids[QK4_NL * 8];
-    int32_t aux_ids[QK4_NL * 8];
-    float frac[QK4_NL * 8];
-    float aux[QK4_NL * 8];
-    uint16_t Iaux[QK4_NL * 8];
-    uint16_t buckets[QK4_NL * 8];
-    int8_t k_indices[510];
+    uint8_t buf[K_SORT_BUF_SIZE_NL(QK4_NL, 16, 8)];
     float weight[QK4_NL];
     uint16_t unused_h;
     uint8_t * unused_l = NULL;
     float scale;
-    k_sort_init(&k_sort, 16, kvalues_iq4nl, odd, step, ids, k_ids, aux_ids, frac, aux, Iaux, buckets, k_indices);
+    k_sort_init(&k_sort, QK4_NL, 16, kvalues_iq4nl, buf);
     for (int64_t row = 0; row < nrow; ++row) {
         block_iq4_nl * iq4 = (block_iq4_nl *)qrow;
         for (int ibl = 0; ibl < nblock; ++ibl) {
@@ -6051,22 +6082,13 @@ void quantize_row_iq4_nl_ref(const float * GGML_RESTRICT x, block_iq4_nl * GGML_
     uint8_t L[QK4_NL];
     uint8_t Laux[QK4_NL];
     struct k_sort k_sort;
-    float odd[16];
-    float step[16];
-    int32_t ids[QK4_NL * 8];
-    int32_t k_ids[QK4_NL * 8];
-    int32_t aux_ids[QK4_NL * 8];
-    float frac[QK4_NL * 8];
-    float aux[QK4_NL * 8];
-    uint16_t Iaux[QK4_NL * 8];
-    uint16_t buckets[QK4_NL * 8];
-    int8_t k_indices[510];
+    uint8_t buf[K_SORT_BUF_SIZE_NL(QK4_NL, 16, 8)];
     float weight[QK4_NL];
     uint16_t unused_h;
     uint8_t * unused_l = NULL;
     float scale;
     block_iq4_nl * iq4 = y;
-    k_sort_init(&k_sort, 16, kvalues_iq4nl, odd, step, ids, k_ids, aux_ids, frac, aux, Iaux, buckets, k_indices);
+    k_sort_init(&k_sort, QK4_NL, 16, kvalues_iq4nl, buf);
     for (int ibl = 0; ibl < nblock; ++ibl) {
         quantize_row_iq4_nl_impl(QK4_NL, 32, x + QK4_NL*ibl, &iq4[ibl].d, iq4[ibl].qs, &unused_h, unused_l,
                 &scale, weight, L, Laux, &k_sort, NULL);
@@ -6080,19 +6102,10 @@ size_t quantize_iq4_xs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     uint8_t L[QK_K];
     uint8_t Laux[32];
     struct k_sort k_sort;
-    float odd[16];
-    float step[16];
-    int32_t ids[QK4_NL * 8];
-    int32_t k_ids[QK4_NL * 8];
-    int32_t aux_ids[QK4_NL * 8];
-    float frac[QK4_NL * 8];
-    float aux[QK4_NL * 8];
-    uint16_t Iaux[QK4_NL * 8];
-    uint16_t buckets[QK4_NL * 8];
-    int8_t k_indices[510];
+    uint8_t buf[K_SORT_BUF_SIZE_NL(QK_K, 16, 8)];
     float weight[32];
     float scales[QK_K/32];
-    k_sort_init(&k_sort, 16, kvalues_iq4nl, odd, step, ids, k_ids, aux_ids, frac, aux, Iaux, buckets, k_indices);
+    k_sort_init(&k_sort, QK_K, 16, kvalues_iq4nl, buf);
     for (int64_t row = 0; row < nrow; ++row) {
         block_iq4_xs * iq4 = (block_iq4_xs *)qrow;
         for (int ibl = 0; ibl < nblock; ++ibl) {
