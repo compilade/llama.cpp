@@ -976,7 +976,10 @@ static struct fraction k_heap_pop(struct k_heap * k_heap) {
     };
 }
 
-// Fast sorting of scales with a hybrid non-comparative sort
+// Fast sorting of scales with a hybrid non-comparative sort.
+//
+// This allows incrementally calculating error (nearly) exhaustively
+// for all scales which result in distinct linear or non-linear quantizations.
 struct k_sort {
     int n;
     int k;  // number of k_values
@@ -4328,21 +4331,21 @@ void iq2xs_init_impl(enum ggml_type type) {
 
     // alternatively, this could be 0xAAAA = 43690, but that would be much bigger unnecessarily.
     const int kmap_size = pow3[8]; // 3**8 = 6561
+    const int nwant = type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ? 3 : type == GGML_TYPE_IQ2_S ? 1 : 2;
     const uint16_t * kgrid = type == GGML_TYPE_IQ2_XXS ? kgrid_2bit_256 :
                              type == GGML_TYPE_IQ2_XS  ? kgrid_2bit_512 :
                              type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ? kgrid_1bit_2048 : kgrid_2bit_1024;
     const int8_t * kvalues = type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ? kvalues_iq1 : kvalues_iq2;
 
-    uint64_t * grid;
-    int      * kmap;
-    uint16_t * kneighbours;
+    uint64_t * kgrid_q2xs;
+    int      * kmap_q2xs;
+    uint16_t * kneighbours_q2xs;
 
     //printf("================================================================= %s(grid_size = %d)\n", __func__, grid_size);
-    // TODO: repack or unpack the grid?
 
-    kmap = (int *) malloc(kmap_size * sizeof(int));
+    kmap_q2xs = (int *) malloc(kmap_size * sizeof(int));
     for (int i = 0; i < kmap_size; ++i) {
-        kmap[i] = -1;
+        kmap_q2xs[i] = -1;
     }
     for (int i = 0; i < grid_size; ++i) {
         int index = 0;
@@ -4354,100 +4357,89 @@ void iq2xs_init_impl(enum ggml_type type) {
             }
             index += l * pow3[k];
         }
-        kmap[index] = i;
+        kmap_q2xs[index] = i;
     }
-    iq2_data[gindex].map = kmap;
+    iq2_data[gindex].map = kmap_q2xs;
 
-    grid = (uint64_t *) malloc(grid_size * sizeof(uint64_t));
+    kgrid_q2xs = (uint64_t *) malloc(grid_size * sizeof(uint64_t));
     for (int i = 0; i < grid_size; ++i) {
-        int8_t * pg = (int8_t *)(grid + i);
+        int8_t * pg = (int8_t *)(kgrid_q2xs + i);
         for (int k = 0; k < 8; ++k) {
             const int l = (kgrid[i] >> (2 * k)) & 3;
             pg[k] = kvalues[l];
         }
     }
-    iq2_data[gindex].grid = grid;
+    iq2_data[gindex].grid = kgrid_q2xs;
 
-    uint16_t * kneighbour_counts = (uint16_t *) malloc(kmap_size * sizeof(uint16_t));
-
-    // TODO: maybe add more constraints on neighbours to avoid redundant calculations
-    //       when doing a sweep for the scale.
-    int num_neighbours = 0;
+    // TODO: figure out which neighbours can be omitted
+    // TODO: figure out how to get all points corresponding to the adjacent voronoi hyperplanes
+    int8_t pos[8];
+    int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+    int num_neighbors = 0;
     int num_not_in_map = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        if (kmap[i] >= 0) {
-            kneighbour_counts[i] = 0;
-            continue;
-        }
-        num_not_in_map += 1;
-        int8_t p[8];
+        if (kmap_q2xs[i] >= 0) { continue; }
+        ++num_not_in_map;
         for (int k = 0; k < 8; ++k) {
-            const int l = (i / pow3[k]) % 3;
-            p[k] = kvalues[l];
+            int l = (i / pow3[k]) % 3;
+            pos[k] = kvalues[l];
         }
-        int min_count = 0;
-        int32_t min_d2 = INT32_MAX;
         for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(grid + j);
-            int32_t d2 = 0;
-            for (int k = 0; k < 8; ++k) {
-                const int32_t d = pg[k] - p[k];
-                d2 += d * d;
-            }
-            if (d2 < min_d2) {
-                min_d2 = d2;
-                min_count = 1;
-            } else if (d2 == min_d2) {
-                min_count += 1;
-            }
+            const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 8; ++k) { d2 += (pg[k] - pos[k])*(pg[k] - pos[k]); }
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
         }
-        kneighbour_counts[i] = min_count;
-        num_neighbours += min_count;
+        qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
+        int n = 0; int d2 = dist2[0];
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) { break; }
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            ++n;
+        }
+        num_neighbors += n;
     }
-
-    kneighbours = (uint16_t *) malloc((num_neighbours + num_not_in_map) * sizeof(uint16_t));
-
-    int offset = 0;
+    printf("%s: %d neighbours in total\n", __func__, num_neighbors);
+    kneighbours_q2xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
+    iq2_data[gindex].neighbours = kneighbours_q2xs;
+    int counter = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        if (kneighbour_counts[i] == 0) {
-            continue;
-        }
-        int8_t p[8];
+        if (kmap_q2xs[i] >= 0) { continue; }
         for (int k = 0; k < 8; ++k) {
-            const int l = (i / pow3[k]) % 3;
-            p[k] = kvalues[l];
+            int l = (i / pow3[k]) % 3;
+            pos[k] = kvalues[l];
         }
-        kneighbours[offset] = kneighbour_counts[i];
-        int min_count = 0;
-        int32_t min_d2 = INT32_MAX;
         for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(grid + j);
-            int32_t d2 = 0;
-            for (int k = 0; k < 8; ++k) {
-                const int32_t d = pg[k] - p[k];
-                d2 += d * d;
-            }
-            if (d2 < min_d2) {
-                min_d2 = d2;
-                min_count = 1;
-            } else if (d2 == min_d2) {
-                min_count += 1;
-            }
-            if (d2 <= min_d2 && min_count <= kneighbour_counts[i]) {
-                kneighbours[offset + min_count] = j;
-            }
+            const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 8; ++k) { d2 += (pg[k] - pos[k])*(pg[k] - pos[k]); }
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
         }
-        GGML_ASSERT(kmap[i] < 0);
-        // reserve -1 for when there is no neighbour
-        kmap[i] = -(offset) - 2;
-        offset += min_count + 1;
-        GGML_ASSERT(min_count == kneighbour_counts[i]);
+        qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
+        kmap_q2xs[i] = -(counter + 1);
+        int d2 = dist2[0];
+        uint16_t * start = &kneighbours_q2xs[counter++];
+        int n = 0;
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) { break; }
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            kneighbours_q2xs[counter++] = dist2[2*j+1];
+            ++n;
+        }
+        *start = n;
     }
-    GGML_ASSERT(offset == num_neighbours + num_not_in_map);
-
-    iq2_data[gindex].neighbours = kneighbours;
-
-    free(kneighbour_counts);
+    GGML_ASSERT(counter == num_neighbors + num_not_in_map);
+    free(dist2);
 }
 
 void iq2xs_free_impl(enum ggml_type type) {
@@ -4460,19 +4452,18 @@ void iq2xs_free_impl(enum ggml_type type) {
     }
 }
 
-// Assuming the desired relative neighbour is additive
 // returns grid_index
 // and stores relative sumqx and sumq2 in the respective arguments
-static int iq2_find_relative_neighbour(const struct k_sort *        k_sort,
-                                       const uint64_t *             grid,
-                                       const int *                  kmap,
-                                       const uint16_t *             kneighbours,
-                                       const float * GGML_RESTRICT  xval,
-                                       const float * GGML_RESTRICT  weight,
-                                       const int8_t * GGML_RESTRICT L,
-                                       float * GGML_RESTRICT        sumqx,
-                                       float * GGML_RESTRICT        sumq2,
-                                       int                          grid_offset) {
+static int iq2_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sort,
+                                       const uint64_t      * GGML_RESTRICT kgrid,
+                                       const int           * GGML_RESTRICT kmap,
+                                       const uint16_t      * GGML_RESTRICT kneighbours,
+                                       const float         * GGML_RESTRICT xval,
+                                       const float         * GGML_RESTRICT weight,
+                                       const int8_t        * GGML_RESTRICT L,
+                                       float               * GGML_RESTRICT sumqx,
+                                       float               * GGML_RESTRICT sumq2,
+                                       int                                 grid_offset) {
     const int pow3[9] = { 1, 3, 9, 27, 81, 243, 729, 2187, 6561 };
     int index = 0;
     int8_t p[8];
@@ -4488,8 +4479,8 @@ static int iq2_find_relative_neighbour(const struct k_sort *        k_sort,
     float sumq2_new = 0.0f;
     float best_d2 = FLT_MAX;
 
-    if (grid_index < -1) {
-        const uint16_t * neighbours = kneighbours - (grid_index + 2);
+    if (grid_index < 0) {
+        const uint16_t * neighbours = kneighbours - (grid_index + 1);
         const int num_neighbours = neighbours[0];
 
         float prev_sumqx = 0.0f;
@@ -4503,24 +4494,26 @@ static int iq2_find_relative_neighbour(const struct k_sort *        k_sort,
         const float prev_scale = prev_sumq2 > 0.0f ? prev_sumqx / prev_sumq2 : 0.0f;
 
         for (int i = 1; i <= num_neighbours; ++i) {
-            const int8_t * pg = (const int8_t *)(grid + neighbours[i]);
-            float this_sumqx = 0.0f;
-            float this_sumq2 = 0.0f;
+            const int8_t * pg = (const int8_t *)(kgrid + neighbours[i]);
             float d2 = 0.0f;
             for (int k = 0; k < 8; ++k) {
-                const float odd = (grid_offset + pg[k]) + p[k];
-                const float step = (grid_offset + pg[k]) - p[k];
                 const float diff = prev_scale * (grid_offset + pg[k]) - xval[k];
-                this_sumqx += weight[k] * (xval[k] * step);
-                this_sumq2 += weight[k] * (odd * step);
                 d2 += waux[k] * diff * diff;
             }
 
             if (d2 < best_d2) {
                 best_d2 = d2;
-                sumqx_new = this_sumqx;
-                sumq2_new = this_sumq2;
                 grid_index = neighbours[i];
+            }
+        }
+
+        if (grid_index >= 0) {
+            const int8_t * pg = (const int8_t *)(kgrid + grid_index);
+            for (int k = 0; k < 8; ++k) {
+                const float odd = (grid_offset + pg[k]) + p[k];
+                const float step = (grid_offset + pg[k]) - p[k];
+                sumqx_new += weight[k] * (xval[k] * step);
+                sumq2_new += weight[k] * (odd * step);
             }
         }
     }
@@ -4621,7 +4614,7 @@ static float make_iq2_quants(int n, struct k_sort * k_sort, const uint64_t * gri
 
         grid_idx_aux[g_i] = grid_index;
 
-        // avoid subtraction numerical instabilities by having relative sumqx and sumq2 per grid index
+        // avoid some subtraction numerical instabilities by having relative sumqx and sumq2 per grid index
         float sumqx_cur = sumqx;
         float sumq2_cur = sumq2;
         for (int j = 0; j < n_idx; ++j) {
@@ -4917,7 +4910,7 @@ size_t quantize_iq2_xs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
 typedef struct {
     uint32_t * grid;
     int      * map;
-    uint8_t * neighbours;
+    uint16_t * neighbours;
 } iq3_entry_t;
 
 static iq3_entry_t iq3_data[2] = {
@@ -4929,6 +4922,12 @@ static inline int iq3_data_index(int grid_size) {
     (void)grid_size;
     GGML_ASSERT(grid_size == 256 || grid_size == 512);
     return grid_size == 256 ? 0 : 1;
+}
+
+static int iq3_compare_func(const void * left, const void * right) {
+    const int * l = (const int *)left;
+    const int * r = (const int *)right;
+    return l[0] < r[0] ? -1 : l[0] > r[0] ? 1 : l[1] < r[1] ? -1 : l[1] > r[1] ? 1 : 0;
 }
 
 void iq3xs_init_impl(int grid_size) {
@@ -4989,21 +4988,28 @@ void iq3xs_init_impl(int grid_size) {
          3736,  3753,  3778,  3802,  3805,  3819,  3841,  3845,  3851,  3856,  3880,  3922,  3938,  3970,  3993,  4032,
     };
 
+    static const int8_t kvalues_iq3s[8] = { 1, 3, 5, 7, 9, 11, 13, 15 };
+    // iq3xxs is similar, but last value would map to 15.5
+    static const int8_t kvalues_iq3xxs[8] = { 0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e };
+
     const int kmap_size = 4096;
+    const int nwant = grid_size == 256 ? 2 : 3;
     const uint16_t * kgrid = grid_size == 256 ? kgrid_256 : kgrid_512;
-    int     * kmap_q3xs;
-    uint8_t * kneighbors_q3xs;
+    const int8_t * kvalues = grid_size == 256 ? kvalues_iq3xxs : kvalues_iq3s;
+    uint32_t * kgrid_q3xs;
+    int      * kmap_q3xs;
+    uint16_t * kneighbors_q3xs;
 
     //printf("================================================================= %s(grid_size = %d)\n", __func__, grid_size);
-    uint32_t * the_grid = (uint32_t *)malloc(grid_size*sizeof(uint32_t));
+    kgrid_q3xs = (uint32_t *)malloc(grid_size*sizeof(uint32_t));
     for (int k = 0; k < grid_size; ++k) {
-        int8_t * pos = (int8_t *)(the_grid + k);
+        int8_t * pos = (int8_t *)(kgrid_q3xs + k);
         for (int i = 0; i < 4; ++i) {
             int l = (kgrid[k] >> 3*i) & 0x7;
-            pos[i] = 2*l + 1;
+            pos[i] = kvalues[l];
         }
     }
-    iq3_data[gindex].grid = the_grid;
+    iq3_data[gindex].grid = kgrid_q3xs;
     kmap_q3xs = (int *)malloc(kmap_size*sizeof(int));
     iq3_data[gindex].map = kmap_q3xs;
     for (int i = 0; i < kmap_size; ++i) {
@@ -5013,44 +5019,74 @@ void iq3xs_init_impl(int grid_size) {
         uint16_t index = kgrid[i];
         kmap_q3xs[index] = i;
     }
-    kneighbors_q3xs = (uint8_t *)malloc(kmap_size*sizeof(uint8_t));
-    // first-order neighbors
+    int8_t pos[4];
+    int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
+    int num_neighbors = 0;
+    int num_not_in_map = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        int n = 0;
+        if (kmap_q3xs[i] >= 0) { continue; }
+        ++num_not_in_map;
         for (int k = 0; k < 4; ++k) {
-            const int l = (i >> (3 * k)) & 0x07;
-            if (l < 7) {
-                const int point = i + (1 << (3 * k));
-                if (kmap_q3xs[point] >= 0) {
-                    n |= 1 << k;
-                }
-            }
+            int l = (i >> 3*k) & 0x7;
+            pos[k] = kvalues[l];
         }
-        kneighbors_q3xs[i] = n;
-    }
-    // higher-order neighbors
-    for (int depth = 0; depth < 8; ++depth) {
-        for (int i = 0; i < kmap_size; ++i) {
-            if (kneighbors_q3xs[i] != 0) {
-                // favor neighbors with smaller hamming distances
-                // and so avoid setting further neighbors once already found
-                continue;
-            }
-            int n = 0;
-            for (int k = 0; k < 4; ++k) {
-                const int l = (i >> (3 * k)) & 0x07;
-                if (l < 7) {
-                    const int point = i + (1 << (3 * k));
-                    if (kneighbors_q3xs[point] != 0) {
-                        n |= 1 << k;
-                    }
-                }
-            }
-            kneighbors_q3xs[i] = n;
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 4; ++k) { d2 += (pg[k] - pos[k])*(pg[k] - pos[k]); }
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
         }
+        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+        int n = 0; int d2 = dist2[0];
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) { break; }
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            ++n;
+        }
+        num_neighbors += n;
     }
-
+    //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
+    kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq3_data[gindex].neighbours = kneighbors_q3xs;
+    int counter = 0;
+    for (int i = 0; i < kmap_size; ++i) {
+        if (kmap_q3xs[i] >= 0) { continue; }
+        for (int k = 0; k < 4; ++k) {
+            int l = (i >> 3*k) & 0x7;
+            pos[k] = kvalues[l];
+        }
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 4; ++k) { d2 += (pg[k] - pos[k])*(pg[k] - pos[k]); }
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
+        }
+        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+        // TODO: reserve -1?
+        kmap_q3xs[i] = -(counter + 1);
+        int d2 = dist2[0];
+        uint16_t * start = &kneighbors_q3xs[counter++];
+        int n = 0;
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) { break; }
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            kneighbors_q3xs[counter++] = dist2[2*j+1];
+            ++n;
+        }
+        *start = n;
+    }
+    GGML_ASSERT(counter == num_neighbors + num_not_in_map);
+    free(dist2);
 }
 
 void iq3xs_free_impl(int grid_size) {
@@ -5063,59 +5099,68 @@ void iq3xs_free_impl(int grid_size) {
     }
 }
 
-// Assuming the desired relative neighbour is additive
 // returns grid_index
 // and stores relative sumqx and sumq2 in the respective arguments
-static int iq3_find_relative_neighbour(const struct k_sort *        k_sort,
-                                       const int *                  kmap,
-                                       const uint8_t *              kneighbours,
-                                       const float * GGML_RESTRICT  xval,
-                                       const float * GGML_RESTRICT  weight,
-                                       const int8_t * GGML_RESTRICT L,
-                                       float * GGML_RESTRICT        sumqx,
-                                       float * GGML_RESTRICT        sumq2) {
+static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sort,
+                                       const uint32_t      * GGML_RESTRICT kgrid,
+                                       const int           * GGML_RESTRICT kmap,
+                                       const uint16_t      * GGML_RESTRICT kneighbours,
+                                       const float         * GGML_RESTRICT xval,
+                                       const float         * GGML_RESTRICT weight,
+                                       const int8_t        * GGML_RESTRICT L,
+                                       float               * GGML_RESTRICT sumqx,
+                                       float               * GGML_RESTRICT sumq2) {
     int index = 0;
+    int8_t p[4];
     for (int i = 0; i < 4; ++i) {
         const int8_t l = L[i] + k_sort->mid_k;
-        GGML_ASSERT(l >= 0 && l < 7);
+        GGML_ASSERT(l >= 0 && l < 8);
         index |= l << (3 * i);
+        p[i] = k_sort->k_values[l];
     }
     int grid_index = kmap[index];
 
     float sumqx_new = 0.0f;
     float sumq2_new = 0.0f;
+    float best_d2 = FLT_MAX;
 
-    while (grid_index < 0) {
-        uint8_t n = kneighbours[index];
-        if (n == 0) { break; }
-        int max_i = -1;
-        float max = -FLT_MAX;
-        // use max available direction
-        for (int i = 0; i < 4; ++i) {
-            if (n & (1 << i)) {
-                const int k_i = ((index >> (3 * max_i)) & 0x07) + 1;
-                GGML_ASSERT(k_i >= 0 && k_i < 7);
-                GGML_ASSERT(k_i != k_sort->mid_k);
-                const float frac = xval[i] / k_sort->odd[k_i];
-                if (frac > max) {
-                    max = frac;
-                    max_i = i;
-                }
+    if (grid_index < 0) {
+        const uint16_t * neighbours = kneighbours - (grid_index + 1);
+        const int num_neighbours = neighbours[0];
+
+        float prev_sumqx = 0.0f;
+        float prev_sumq2 = 0.0f;
+        float waux[8];
+        for (int k = 0; k < 4; ++k) {
+            prev_sumqx += weight[k] * (xval[k] * p[k]);
+            prev_sumq2 += weight[k] * (p[k] * p[k]);
+            waux[k] = sqrtf(weight[k]);
+        }
+        const float prev_scale = prev_sumq2 > 0.0f ? prev_sumqx / prev_sumq2 : 0.0f;
+
+        for (int i = 1; i <= num_neighbours; ++i) {
+            const int8_t * pg = (const int8_t *)(kgrid + neighbours[i]);
+            float d2 = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                const float diff = prev_scale * pg[k] - xval[k];
+                d2 += waux[k] * diff * diff;
+            }
+
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                grid_index = neighbours[i];
             }
         }
-        GGML_ASSERT(max_i >= 0);
 
-        {
-            const int k_i = ((index >> (3 * max_i)) & 0x07) + 1;
-            const float w = weight[max_i];
-            const float odd = k_sort->odd[k_i];
-            const float step = k_sort->step[k_i];
-            sumqx_new += w * (xval[max_i] * step);
-            sumq2_new += w * (odd * step);
+        if (grid_index >= 0) {
+            const int8_t * pg = (const int8_t *)(kgrid + grid_index);
+            for (int k = 0; k < 4; ++k) {
+                const float odd = pg[k] + p[k];
+                const float step = pg[k] - p[k];
+                sumqx_new += weight[k] * (xval[k] * step);
+                sumq2_new += weight[k] * (odd * step);
+            }
         }
-        index += 1 << (3 * max_i);
-
-        grid_index = kmap[index];
     }
 
     *sumqx = sumqx_new;
@@ -5148,7 +5193,7 @@ static int iq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, co
     return grid_index;
 }
 
-static float make_iq3_quant(int n, struct k_sort * k_sort, const int * kmap, const uint8_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
+static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const uint16_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
     GGML_ASSERT(n % 4 == 0);
     const int n_idx = n / 4;
 
@@ -5207,21 +5252,23 @@ static float make_iq3_quant(int n, struct k_sort * k_sort, const int * kmap, con
         sumq2 += w * (odd * step);
         Laux[ii] = k_i;
 
-        const int grid_index = iq3_find_relative_neighbour(k_sort, kmap, kneighbors, xval + 4*g_i, weight + 4*g_i, Laux + 4*g_i, sumqx_aux + g_i, sumq2_aux + g_i);
+        const int grid_index = iq3_find_relative_neighbour(k_sort, kgrid, kmap, kneighbors, xval + 4*g_i, weight + 4*g_i, Laux + 4*g_i, sumqx_aux + g_i, sumq2_aux + g_i);
 
         if (grid_index == grid_idx_aux[g_i]) { continue; }
         if (grid_index < 0) { break; }
 
         grid_idx_aux[g_i] = grid_index;
 
+        // avoid some subtraction numerical instabilities by having relative sumqx and sumq2 per grid index
         float sumqx_cur = sumqx;
         float sumq2_cur = sumq2;
         for (int j = 0; j < n_idx; ++j) {
             sumqx_cur += sumqx_aux[j];
             sumq2_cur += sumq2_aux[j];
         }
+
         const float current = sumqx_cur * sumqx_cur;
-        if (sumq2_cur > 0.0f && sumqx_cur > 0.0f && current * best_sumq2 > best * sumq2_cur) {
+        if (sumq2_cur > 0.0f && current * best_sumq2 > best * sumq2_cur) {
             best = current;
             best_sumqx = sumqx_cur;
             best_sumq2 = sumq2_cur;
@@ -5241,7 +5288,7 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
 
     const uint32_t * kgrid_q3xs      = iq3_data[gindex].grid;
     const int      * kmap_q3xs       = iq3_data[gindex].map;
-    const uint8_t  * kneighbors_q3xs = iq3_data[gindex].neighbours;
+    const uint16_t * kneighbors_q3xs = iq3_data[gindex].neighbours;
 
     //GGML_ASSERT(quant_weights   && "missing quantization weights");
     GGML_ASSERT(kgrid_q3xs      && "forgot to call ggml_quantize_init()?");
@@ -5249,7 +5296,9 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
     GGML_ASSERT(kneighbors_q3xs && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(n%QK_K == 0);
 
-    const int8_t k_values_iq3_xxs[8] = { 0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e };
+    const int8_t k_values_iq3xxs[8] = { 0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e };
+    // actual IQ3_XSS scale kvalues are { 0.25, 0.75, 1.25, ... }, which are odd numbers divided by 4
+    const int8_t k_values_iq3xxs_s[16] = { 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31 };
 
     const int64_t nbl = n/QK_K;
 
@@ -5260,6 +5309,9 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
     const int quant_size = block_size - sizeof(ggml_fp16_t);
 
     float scales[QK_K/32];
+    float sw[QK_K/32];
+    int8_t Ls[QK_K/32];
+    int8_t Lsaux[QK_K/32];
     float weight[32];
     float xval[32];
     int8_t Laux[32];
@@ -5272,15 +5324,16 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
     uint32_t * scales_and_signs = (uint32_t *)(q3 + QK_K/4);
     struct k_sort k_sort;
     uint8_t buf[K_SORT_BUF_SIZE_NL(32, 8, 7)];
+    struct k_sort k_sort_s;
+    uint8_t buf_s[K_SORT_BUF_SIZE_NL(QK_K/32, 16, 15)];
 
-    k_sort_init(&k_sort, 32, 8, k_values_iq3_xxs, buf);
+    k_sort_init(&k_sort, 32, 8, k_values_iq3xxs, buf);
+    k_sort_init(&k_sort_s, QK_K/32, 16, k_values_iq3xxs_s, buf_s);
 
     for (int ibl = 0; ibl < nbl; ++ibl) {
 
         dh[0] = GGML_FP32_TO_FP16(0.f);
         memset(q3, 0, 3*QK_K/8+QK_K/32);
-
-        float max_scale = 0;
 
         const float * xbl = x + QK_K*ibl;
         float sumx2 = 0;
@@ -5300,6 +5353,13 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 for (int i = 0; i < 32; ++i) {
                     weight[i] = xb[i]*xb[i];
                 }
+            }
+            {
+                float sumw = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    sumw += weight[i];
+                }
+                sw[ib] = sumw;
             }
             for (int k = 0; k < 4; ++k) {
                 int nflip = 0;
@@ -5331,7 +5391,7 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 block_signs[k] = s & 127;
             }
 
-            const float scale = make_iq3_quant(32, &k_sort, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quant(32, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
 
             for (int k = 0; k < 8; ++k) {
                 int grid_index = grid_idx[k];
@@ -5340,24 +5400,12 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
             scales_and_signs[ib] = block_signs[0] | (block_signs[1] << 7) | (block_signs[2] << 14) | (block_signs[3] << 21);
             GGML_ASSERT(scale >= 0);
             scales[ib] = scale;
-            max_scale = MAX(max_scale, scale);
         }
 
-        if (!max_scale) {
-            memset(qs, 0, quant_size);
-            dh += block_size/sizeof(ggml_fp16_t);
-            qs += block_size;
-            continue;
-        }
-
-        // TODO: maybe use make_qkxs_quants here?
-        float d = max_scale/31;
-        // dh[0] = GGML_FP32_TO_FP16(d * 1.0125f);  // small improvement via this fudge factor
-        dh[0] = GGML_FP32_TO_FP16(d);
-        float id = 1/d;
+        const float d = make_qkxs_nl_quants(QK_K/32, scales, sw, Ls, Lsaux, &k_sort_s, false, true);
+        dh[0] = GGML_FP32_TO_FP16(d * 4.0f);
         for (int ib = 0; ib < QK_K/32; ++ib) {
-            int l = nearest_int(0.5f*(id*scales[ib]-1));
-            l = MAX(0, MIN(15, l));
+            const int8_t l = Ls[ib];
             scales_and_signs[ib] |= ((uint32_t)l << 28);
         }
         memcpy(qs, q3, quant_size);
@@ -5392,7 +5440,7 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
 
     const uint32_t * kgrid_q3xs      = iq3_data[gindex].grid;
     const int      * kmap_q3xs       = iq3_data[gindex].map;
-    const uint8_t  * kneighbors_q3xs = iq3_data[gindex].neighbours;
+    const uint16_t * kneighbors_q3xs = iq3_data[gindex].neighbours;
 
     //GGML_ASSERT(quant_weights   && "missing quantization weights");
     GGML_ASSERT(kgrid_q3xs      && "forgot to call ggml_quantize_init()?");
@@ -5400,7 +5448,8 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
     GGML_ASSERT(kneighbors_q3xs && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(n%QK_K == 0);
 
-    const int8_t k_values_iq3_s[8] = { 0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f };
+    const int8_t k_values_iq3s[8] = { 0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f };
+    const int8_t k_values_iq3s_s[16] = { 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31 };
 
     const int64_t nbl = n / QK_K;
 
@@ -5411,6 +5460,9 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
     const int bs8 = block_size/8;
 
     float scales[QK_K/IQ3S_BLOCK_SIZE];
+    float sw[QK_K/IQ3S_BLOCK_SIZE];
+    int8_t Ls[QK_K/IQ3S_BLOCK_SIZE];
+    int8_t Lsaux[QK_K/IQ3S_BLOCK_SIZE];
     float weight[IQ3S_BLOCK_SIZE];
     float xval[IQ3S_BLOCK_SIZE];
     int8_t Laux[IQ3S_BLOCK_SIZE];
@@ -5421,8 +5473,11 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
     uint8_t block_signs[IQ3S_BLOCK_SIZE/8];
     struct k_sort k_sort;
     uint8_t buf[K_SORT_BUF_SIZE_NL(IQ3S_BLOCK_SIZE, 8, 7)];
+    struct k_sort k_sort_s;
+    uint8_t buf_s[K_SORT_BUF_SIZE_NL(QK_K/IQ3S_BLOCK_SIZE, 16, 15)];
 
-    k_sort_init(&k_sort, IQ3S_BLOCK_SIZE, 8, k_values_iq3_s, buf);
+    k_sort_init(&k_sort, IQ3S_BLOCK_SIZE, 8, k_values_iq3s, buf);
+    k_sort_init(&k_sort_s, QK_K/IQ3S_BLOCK_SIZE, 16, k_values_iq3s_s, buf_s);
 
     for (int ibl = 0; ibl < nbl; ++ibl) {
 
@@ -5432,8 +5487,6 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
         uint8_t * qs = y[ibl].qs;
         uint8_t * qh = y[ibl].qh;
         uint8_t * signs = y[ibl].signs;
-
-        float max_scale = 0;
 
         const float * xbl = x + QK_K*ibl;
         float sumx2 = 0;
@@ -5454,6 +5507,13 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                     weight[i] = xb[i]*xb[i];
                 }
             }
+            {
+                float sumw = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    sumw += weight[i];
+                }
+                sw[ib] = sumw;
+            }
             for (int k = 0; k < bs8; ++k) {
                 uint8_t s = 0;
                 for (int i = 0; i < 8; ++i) {
@@ -5465,7 +5525,7 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 }
                 block_signs[k] = s;
             }
-            const float scale = make_iq3_quant(32, &k_sort, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quant(block_size, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
             for (int k = 0; k < bs4; ++k) {
                 int grid_index = grid_idx[k];
                 qs[k] = grid_index & 255;
@@ -5478,23 +5538,13 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
             signs += bs8;
             GGML_ASSERT(scale >= 0);
             scales[ib] = scale;
-            max_scale = MAX(max_scale, scale);
         }
 
-        if (!max_scale) {
-            continue;
-        }
-
-        // TODO: maybe use make_qkxs_quants here?
-        float d = max_scale/31;
-        // y[ibl].d = GGML_FP32_TO_FP16(d * 1.033f);
+        const float d = make_qkxs_nl_quants(QK_K/block_size, scales, sw, Ls, Lsaux, &k_sort_s, false, true);
         y[ibl].d = GGML_FP32_TO_FP16(d);
-        float id = 1/d;
         for (int ib = 0; ib < QK_K/block_size; ib += 2) {
-            int l1 = nearest_int(0.5f*(id*scales[ib+0]-1));
-            l1 = MAX(0, MIN(15, l1));
-            int l2 = nearest_int(0.5f*(id*scales[ib+1]-1));
-            l2 = MAX(0, MIN(15, l2));
+            const int8_t l1 = Ls[ib+0];
+            const int8_t l2 = Ls[ib+1];
             y[ibl].scales[ib/2] = l1 | (l2 << 4);
         }
 
@@ -5520,83 +5570,6 @@ void quantize_row_iq3_s_ref(const float * GGML_RESTRICT x, block_iq3_s * GGML_RE
 
 
 // =================================== 1.5 bpw ===================================================
-
-// returns grid_index
-// and stores relative sumqx and sumq2 in the respective arguments
-static int iq1_find_relative_neighbour(const struct k_sort *        k_sort,
-                                       const int *                  kmap,
-                                       const uint8_t *              kneighbours_p,
-                                       const uint8_t *              kneighbours_n,
-                                       const float * GGML_RESTRICT  xval,
-                                       const float * GGML_RESTRICT  weight,
-                                       const int8_t * GGML_RESTRICT L,
-                                       float * GGML_RESTRICT        sumqx,
-                                       float * GGML_RESTRICT        sumq2) {
-    const int pow3[9] = { 1, 3, 9, 27, 81, 243, 729, 2187, 6561 };
-    int index = 0;
-    int8_t Laux[8];
-    for (int i = 0; i < 8; ++i) {
-        const int8_t l = L[i] + k_sort->mid_k;
-        GGML_ASSERT(l >= 0 && l < 3);
-        index += l * pow3[i];
-        Laux[i] = l;
-    }
-    int grid_index = kmap[index];
-
-    float sumqx_new = 0.0f;
-    float sumq2_new = 0.0f;
-
-    if (grid_index < 0) {
-        uint8_t sign_mask = 0; // bits are 1 for negative, 0 for positive
-        for (int i = 0; i < 8; ++i) {
-            if (xval[i] < 0.0f) {
-                sign_mask |= 1 << i;
-            }
-        }
-
-        do {
-            uint8_t n = (kneighbours_p[index] & ~sign_mask) | (kneighbours_n[index] & sign_mask);
-            if (n == 0) { break; }
-            float max = -FLT_MAX;
-            int max_i = -1;
-            int8_t max_sign = 0;
-            // use max available direction
-            for (int i = 0; i < 8; ++i) {
-                if (n & (1 << i)) {
-                    const int8_t sign = xval[i] < 0.0f ? -1 : 1;
-                    const int8_t k_i = Laux[i] + sign;
-                    GGML_ASSERT(k_i >= 0 && k_i < 3);
-                    GGML_ASSERT(k_i != k_sort->mid_k);
-                    const float frac = fabsf(xval[i]) / k_sort->odd[k_i];
-                    if (frac > max) {
-                        max = frac;
-                        max_i = i;
-                        max_sign = sign;
-                    }
-                }
-            }
-            GGML_ASSERT(max_i >= 0);
-
-            {
-                const int8_t k_i = Laux[max_i] + max_sign;
-                const float w = weight[max_i];
-                const float odd = k_sort->odd[k_i];
-                const float step = k_sort->step[k_i];
-                sumqx_new += w * (fabsf(xval[max_i]) * step);
-                sumq2_new += w * (odd * step);
-                Laux[max_i] = k_i;
-            }
-            index += max_sign * pow3[max_i];
-
-            grid_index = kmap[index];
-        } while (grid_index < 0);
-    }
-
-    *sumqx = sumqx_new;
-    *sumq2 = sumq2_new;
-
-    return grid_index;
-}
 
 static int iq1_find_best_neighbour2(const uint16_t * GGML_RESTRICT neighbours, const uint64_t * GGML_RESTRICT grid,
         const float * GGML_RESTRICT xval, const float * GGML_RESTRICT weight, float scale, const float * GGML_RESTRICT xg, int8_t * GGML_RESTRICT L, int ngrid) {
@@ -5661,6 +5634,9 @@ static int iq1_sort_helper(const void * left, const void * right) {
     return *l < *r ? -1 : *l > *r ? 1 : 0;
 }
 
+static float make_iq1_quants(int n, const float * xval, const float * weight, struct k_sort * k_sort, float * sumlx, float * suml2) {
+}
+
 #define IQ1S_BLOCK_SIZE 32
 #define IQ1M_BLOCK_SIZE 16
 static void quantize_row_iq1_s_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, const float * GGML_RESTRICT quant_weights,
@@ -5691,17 +5667,6 @@ static void quantize_row_iq1_s_impl(const float * GGML_RESTRICT x, void * GGML_R
 
     const int block_size = IQ1S_BLOCK_SIZE;
 
-    // would use a static assert, but non-integer constant folding is a gnu extension
-    GGML_ASSERT(IQ1S_DELTA * 8.0f == 1.0f);
-
-    const int8_t k_values_iq1s_p[3] = { -7, 1, 9 };
-    const int8_t k_values_iq1s_n[3] = { -9, -1, 7 };
-    // // FIXME: integer kvalues from this? (by scaling by 8?)
-
-    const float x_p[3] = {-1 + IQ1S_DELTA,  IQ1S_DELTA, 1 + IQ1S_DELTA};
-    const float x_m[3] = {-1 - IQ1S_DELTA, -IQ1S_DELTA, 1 - IQ1S_DELTA};
-
-
     int * idx = (int *)(pairs + 1);
 
     for (int ibl = 0; ibl < nbl; ++ibl) {
@@ -5720,7 +5685,12 @@ static void quantize_row_iq1_s_impl(const float * GGML_RESTRICT x, void * GGML_R
         for (int ib = 0; ib < QK_K/block_size; ++ib) {
             const float * xb = xbl + block_size*ib;
             const float * qw = quant_weights + QK_K*ibl + block_size*ib;
-            for (int i = 0; i < block_size; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
+            for (int i = 0; i < block_size; ++i) {
+                weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
+            }
+
+            // FIXME: use something like make_iq2_quants but which checks the two possible offsets
+
             float max = fabsf(xb[0]);
             for (int i = 1; i < block_size; ++i) max = MAX(max, fabsf(xb[i]));
             if (max < GROUP_MAX_EPS_IQ1_S) {
@@ -5749,22 +5719,22 @@ static void quantize_row_iq1_s_impl(const float * GGML_RESTRICT x, void * GGML_R
             }
             float best_score = -FLT_MIN, scale = max;
             int besti1 = -1, besti2 = -1, best_shift = 0;
-            for (int i1 = 0; i1 <= block_size; ++i1) {
-                for (int i2 = i1; i2 <= block_size; ++i2) {
-                    float sumqx = (sumx[i1] - sumx[0])*x_p[0] + (sumx[i2] - sumx[i1])*x_p[1] + (sumx[block_size] - sumx[i2])*x_p[2];
-                    float sumq2 = (sumw[i1] - sumw[0])*x_p[0]*x_p[0] + (sumw[i2] - sumw[i1])*x_p[1]*x_p[1] + (sumw[block_size] - sumw[i2])*x_p[2]*x_p[2];
-                    if (sumq2 > 0 && sumqx*sumqx > best_score*sumq2) {
-                        scale = sumqx/sumq2; best_score = scale*sumqx;
-                        besti1 = i1; besti2 = i2; best_shift = 1;
-                    }
-                    sumqx = (sumx[i1] - sumx[0])*x_m[0] + (sumx[i2] - sumx[i1])*x_m[1] + (sumx[block_size] - sumx[i2])*x_m[2];
-                    sumq2 = (sumw[i1] - sumw[0])*x_m[0]*x_m[0] + (sumw[i2] - sumw[i1])*x_m[1]*x_m[1] + (sumw[block_size] - sumw[i2])*x_m[2]*x_m[2];
-                    if (sumq2 > 0 && sumqx*sumqx > best_score*sumq2) {
-                        scale = sumqx/sumq2; best_score = scale*sumqx;
-                        besti1 = i1; besti2 = i2; best_shift = -1;
-                    }
-                }
-            }
+            // for (int i1 = 0; i1 <= block_size; ++i1) {
+            //     for (int i2 = i1; i2 <= block_size; ++i2) {
+            //         float sumqx = (sumx[i1] - sumx[0])*x_p[0] + (sumx[i2] - sumx[i1])*x_p[1] + (sumx[block_size] - sumx[i2])*x_p[2];
+            //         float sumq2 = (sumw[i1] - sumw[0])*x_p[0]*x_p[0] + (sumw[i2] - sumw[i1])*x_p[1]*x_p[1] + (sumw[block_size] - sumw[i2])*x_p[2]*x_p[2];
+            //         if (sumq2 > 0 && sumqx*sumqx > best_score*sumq2) {
+            //             scale = sumqx/sumq2; best_score = scale*sumqx;
+            //             besti1 = i1; besti2 = i2; best_shift = 1;
+            //         }
+            //         sumqx = (sumx[i1] - sumx[0])*x_m[0] + (sumx[i2] - sumx[i1])*x_m[1] + (sumx[block_size] - sumx[i2])*x_m[2];
+            //         sumq2 = (sumw[i1] - sumw[0])*x_m[0]*x_m[0] + (sumw[i2] - sumw[i1])*x_m[1]*x_m[1] + (sumw[block_size] - sumw[i2])*x_m[2]*x_m[2];
+            //         if (sumq2 > 0 && sumqx*sumqx > best_score*sumq2) {
+            //             scale = sumqx/sumq2; best_score = scale*sumqx;
+            //             besti1 = i1; besti2 = i2; best_shift = -1;
+            //         }
+            //     }
+            // }
             GGML_ASSERT(besti1 >= 0 && besti2 >= 0 && best_shift != 0);
             for (int j =      0; j < besti1; ++j) L[idx[2*j]] = 0;
             for (int j = besti1; j < besti2; ++j) L[idx[2*j]] = 1;
@@ -5774,33 +5744,34 @@ static void quantize_row_iq1_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 scale = -scale; best_shift = -best_shift;
             }
             bool all_on_grid = true;
-            const float * xx = best_shift == 1 ? x_p : x_m;
-            for (int k = 0; k < block_size/8; ++k) {
-                uint16_t u = 0;
-                for (int j = 0; j < 8; ++j) u |= (L[8*k+j] << 2*j);
-                int grid_index = kmap_q2xs[u];
-                if (grid_index < 0) {
-                    all_on_grid = false;
-                    // const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
-                    const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
-                    grid_index = iq1_find_best_neighbour2(neighbours, kgrid_q2xs, xb + 8*k, weight + 8*k, scale, xx, L + 8*k, NGRID_IQ1S);
-                    GGML_ASSERT(grid_index >= 0);
-                }
-                index[k] = grid_index;
-            }
-            if (!all_on_grid) {
-                float sumqx = 0, sumq2 = 0;
-                for (int k = 0; k < block_size/8; ++k) {
-                    const int8_t * pg = (const int8_t *)(kgrid_q2xs + index[k]);
-                    for (int j = 0; j < 8; ++j) {
-                        float w = weight[8*k + j];
-                        float q = xx[(pg[j] - 1)/2];
-                        sumqx += w*q*xb[8*k+j];
-                        sumq2 += w*q*q;
-                    }
-                }
-                if (sumqx > 0 && sumq2 > 0) scale = sumqx/sumq2;
-            }
+            // const float * xx = best_shift == 1 ? x_p : x_m;
+            // for (int k = 0; k < block_size/8; ++k) {
+            //     uint16_t u = 0;
+            //     for (int j = 0; j < 8; ++j) u |= (L[8*k+j] << 2*j);
+            //     int grid_index = kmap_q2xs[u];
+            //     if (grid_index < 0) {
+            //         all_on_grid = false;
+            //         // const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+            //         const uint16_t * neighbours = kneighbors_q2xs - kmap_q2xs[u] - 1;
+            //         grid_index = iq1_find_best_neighbour2(neighbours, kgrid_q2xs, xb + 8*k, weight + 8*k, scale, xx, L + 8*k, NGRID_IQ1S);
+            //         GGML_ASSERT(grid_index >= 0);
+            //     }
+            //     index[k] = grid_index;
+            // }
+            // if (!all_on_grid) {
+            //     float sumqx = 0, sumq2 = 0;
+            //     for (int k = 0; k < block_size/8; ++k) {
+            //         const int8_t * pg = (const int8_t *)(kgrid_q2xs + index[k]);
+            //         for (int j = 0; j < 8; ++j) {
+            //             float w = weight[8*k + j];
+            //             float q = xx[(pg[j] - 1)/2];
+            //             sumqx += w*q*xb[8*k+j];
+            //             sumq2 += w*q*q;
+            //         }
+            //     }
+            //     if (sumqx > 0 && sumq2 > 0) scale = sumqx/sumq2;
+            // }
+
             uint16_t h = 0;
             for (int k = 0; k < block_size/8; ++k) {
                 y[ibl].qs[(block_size/8)*ib + k] = index[k] & 255;
@@ -5813,37 +5784,45 @@ static void quantize_row_iq1_s_impl(const float * GGML_RESTRICT x, void * GGML_R
             max_scale = MAX(max_scale, scale);
         }
 
-        if (!max_scale) {
-            continue;
-        }
-
-        // TODO: maybe use make_qkxs_quants here?
-        float d = max_scale/15;
-        y[ibl].d = GGML_FP32_TO_FP16(d*1.125f); // 1.125f is another fudge factor. Don't ask me why it is needed.
-        float id = 1/d;
-        for (int ib = 0; ib < QK_K/block_size; ++ib) {
-            int l = nearest_int(0.5f*(id*scales[ib]-1));
-            l = MAX(0, MIN(7, l));
-            if (shifts[ib] == -1) l |= 8;
-            y[ibl].qh[ib] |= (l << 12);
-        }
+        // float d = make_qkxs_nl_quants(QK_K/block_size, scales, sw, Ls, Lsaux, &k_sort, false, true);
+        // // y[ibl].d = GGML_FP32_TO_FP16(d*1.125f); // 1.125f is another fudge factor. Don't ask me why it is needed.
+        // y[ibl].d = GGML_FP32_TO_FP16(d * 8.0f);
+        // for (int ib = 0; ib < QK_K/block_size; ++ib) {
+        //     const uint32_t l = Ls[ib];
+        //     if (shifts[ib] == -1) l |= 8;
+        //     y[ibl].qh[ib] |= (l << 12);
+        // }
     }
 }
 
 size_t quantize_iq1_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     GGML_ASSERT(n_per_row%QK_K == 0);
+    // would use a static assert, but non-integer constant folding is a gnu extension
+    GGML_ASSERT(IQ1S_DELTA * 8.0f == 1.0f);
+    const int8_t kvalues_iq1s_p[3] = {-7, 1, 9};
+    const int8_t kvalues_iq1s_n[3] = {-9, -1, 7};
+    const int8_t kvalues_iq1s_s[8] = {1, 3, 5, 7, 9, 11, 13, 15};
     float  scales[QK_K/IQ1S_BLOCK_SIZE];
     float  weight[IQ1S_BLOCK_SIZE];
-    int8_t L[IQ1S_BLOCK_SIZE];
+    int8_t Laux[IQ1S_BLOCK_SIZE];
     float  sumx[IQ1S_BLOCK_SIZE+1];
     float  sumw[IQ1S_BLOCK_SIZE+1];
     float  pairs[2*IQ1S_BLOCK_SIZE];
     uint16_t index[IQ1S_BLOCK_SIZE/8];
     int8_t shifts[QK_K/IQ1S_BLOCK_SIZE];
+    struct k_sort k_sort_p;
+    struct k_sort k_sort_n;
+    struct k_sort k_sort_s;
+    uint8_t buf_p[K_SORT_BUF_SIZE_NL(IQ1S_BLOCK_SIZE, 3, 2)];
+    uint8_t buf_n[K_SORT_BUF_SIZE_NL(IQ1S_BLOCK_SIZE, 3, 2)];
+    uint8_t buf_s[K_SORT_BUF_SIZE_NL(QK_K/IQ1S_BLOCK_SIZE, 8, 7)];
     int64_t nblock = n_per_row/QK_K;
     char * qrow = (char *)dst;
+    k_sort_init(&k_sort_p, IQ1S_BLOCK_SIZE, 3, kvalues_iq1s_p, buf_p);
+    k_sort_init(&k_sort_n, IQ1S_BLOCK_SIZE, 3, kvalues_iq1s_n, buf_n);
+    k_sort_init(&k_sort_s, QK_K/IQ1S_BLOCK_SIZE, 8, kvalues_iq1s_s, buf_s);
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_iq1_s_impl(src, qrow, n_per_row, quant_weights, scales, weight, sumx, sumw, pairs, L, index, shifts);
+        // quantize_row_iq1_s_impl(src, qrow, n_per_row, quant_weights, scales, weight, sumx, sumw, pairs, L, index, shifts);
         src += n_per_row;
         qrow += nblock*sizeof(block_iq1_s);
     }
