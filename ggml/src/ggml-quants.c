@@ -5107,9 +5107,10 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
                                        const uint16_t      * GGML_RESTRICT kneighbours,
                                        const float         * GGML_RESTRICT xval,
                                        const float         * GGML_RESTRICT weight,
-                                       const int8_t        * GGML_RESTRICT L,
-                                       float               * GGML_RESTRICT sumqx,
-                                       float               * GGML_RESTRICT sumq2) {
+                                       const int8_t        * GGML_RESTRICT L) {
+                                       // float               * GGML_RESTRICT sumqx,
+                                       // float               * GGML_RESTRICT sumq2) {
+                                       // float                               scale) {
     int index = 0;
     int8_t p[4];
     for (int i = 0; i < 4; ++i) {
@@ -5120,8 +5121,8 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
     }
     int grid_index = kmap[index];
 
-    float sumqx_new = 0.0f;
-    float sumq2_new = 0.0f;
+    // float sumqx_new = 0.0f;
+    // float sumq2_new = 0.0f;
     float best_d2 = FLT_MAX;
 
     if (grid_index < 0) {
@@ -5130,13 +5131,17 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
 
         float prev_sumqx = 0.0f;
         float prev_sumq2 = 0.0f;
-        float waux[8];
+        float waux[4];
         for (int k = 0; k < 4; ++k) {
             prev_sumqx += weight[k] * (xval[k] * p[k]);
             prev_sumq2 += weight[k] * (p[k] * p[k]);
             waux[k] = sqrtf(weight[k]);
         }
-        const float prev_scale = prev_sumq2 > 0.0f ? prev_sumqx / prev_sumq2 : 0.0f;
+        float prev_scale = prev_sumq2 > 0.0f ? prev_sumqx / prev_sumq2 : 0.0f;
+        // fudge factor to penalize points which make the scale smaller
+        // FIXME: formalize
+        // prev_scale *= 33.0f / 32.0f;
+        // const float prev_scale = (prev_sumq2 > 0.0f ? prev_sumqx / prev_sumq2 : 0.0f) * (17.0f/16.0f);
 
         for (int i = 1; i <= num_neighbours; ++i) {
             const int8_t * pg = (const int8_t *)(kgrid + neighbours[i]);
@@ -5144,6 +5149,7 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
             for (int k = 0; k < 4; ++k) {
                 const float diff = prev_scale * pg[k] - xval[k];
                 d2 += waux[k] * diff * diff;
+                // d2 += weight[k] * diff * diff;
             }
 
             if (d2 < best_d2) {
@@ -5152,21 +5158,67 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
             }
         }
 
-        if (grid_index >= 0) {
-            const int8_t * pg = (const int8_t *)(kgrid + grid_index);
-            for (int k = 0; k < 4; ++k) {
-                const float odd = pg[k] + p[k];
-                const float step = pg[k] - p[k];
-                sumqx_new += weight[k] * (xval[k] * step);
-                sumq2_new += weight[k] * (odd * step);
-            }
-        }
+        // if (grid_index >= 0) {
+        //     const int8_t * pg = (const int8_t *)(kgrid + grid_index);
+        //     for (int k = 0; k < 4; ++k) {
+        //         const float odd = pg[k] + p[k];
+        //         const float step = pg[k] - p[k];
+        //         sumqx_new += weight[k] * (xval[k] * step);
+        //         sumq2_new += weight[k] * (odd * step);
+        //     }
+        // }
     }
 
-    *sumqx = sumqx_new;
-    *sumq2 = sumq2_new;
+    // *sumqx = sumqx_new;
+    // *sumq2 = sumq2_new;
 
     return grid_index;
+}
+
+// Get the inverse scaling factor to get xval at the boundary between two representable points
+// When the boundary isn't orthogonal to an axis, the relative weights of the axes are relevant.
+static float iq3_scale_between(const uint32_t * grid, const float * xval, const float * weight, int grid_index0, int grid_index1) {
+
+    const int8_t * p0 = (const int8_t *)(grid + grid_index0);
+    const int8_t * p1 = (const int8_t *)(grid + grid_index1);
+    float sumhx = 0.0f;
+    float sumh2 = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        const float x = xval[i];
+        // TODO: figure out why the square root of w is better?
+        const float w = sqrtf(weight[i]);
+        // const float w = weight[i];
+        // A point on the target mid-point hyperplane
+        const float h_mid = (p1[i] + p0[i]) / 2.0f;
+        // The direction of the normal vector of the hyperplane
+        // const float h_dir = w * abs(p1[i] - p0[i]);
+        const float h_dir = w * (p1[i] - p0[i]);
+        sumhx += x * h_dir;
+        sumh2 += h_mid * h_dir;
+    }
+
+    const float scale = sumh2 > 0.0f ? sumhx / sumh2 : 0.0f;
+
+    // {
+    //     const float iscale = scale ? 1.0f / scale : 0.0f;
+    //     float d2[2] = {0.0f, 0.0f};
+    //     float d2w[2] = {0.0f, 0.0f};
+    //     for (int i = 0; i < 4; ++i) {
+    //         const float w = weight[i];
+    //         const float waux = sqrtf(w);
+    //         const float diff0 = p0[i] - iscale * xval[i];
+    //         const float diff1 = p1[i] - iscale * xval[i];
+
+    //         d2[0] += w * diff0 * diff0;
+    //         d2[1] += w * diff1 * diff1;
+    //         d2w[0] += waux * diff0 * diff0;
+    //         d2w[1] += waux * diff1 * diff1;
+    //     }
+    //     fprintf(stderr, "%s: d2[0]: %f, d2[1]: %f, d2w[0]: %f, d2w[1]: %f\n", __func__, d2[0], d2[1], d2w[0], d2w[1]);
+    // }
+
+    // return scale;
+    return scale;
 }
 
 static int iq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, const uint32_t * GGML_RESTRICT grid,
@@ -5193,7 +5245,23 @@ static int iq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, co
     return grid_index;
 }
 
-static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const uint16_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
+struct grid_id_scale {
+    float scale;
+    int16_t grid_index;
+    int16_t g_i;
+};
+
+// TODO: use a hybrid bucket sort instead?
+static int grid_id_scale_sort_desc(const void * left, const void * right) {
+    const struct grid_id_scale * l = (const struct grid_id_scale *) left;
+    const struct grid_id_scale * r = (const struct grid_id_scale *) right;
+
+    if (l->scale == r->scale) { return 0; }
+    // sort descending
+    return l->scale > r->scale ? -1 : 1;
+}
+
+static float make_iq3_quants(int n, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const uint16_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
     GGML_ASSERT(n % 4 == 0);
     const int n_idx = n / 4;
 
@@ -5203,6 +5271,9 @@ static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgri
         grid_idx_aux[i] = 0;
         grid_idx[i] = 0;
     }
+
+    struct grid_id_scale grid_ids[32*8];
+    int n_grid_id_scale = 0;
 
     float sumqx = 0.0f;
     float sumq2 = 0.0f;
@@ -5222,6 +5293,8 @@ static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgri
         Laux[i] = k_sort->mid_k;
         sumqx += w * (x * kmin);
         sumq2 += w * (kmin * kmin);
+        sumqx_aux[i / 4] += w * (x * kmin);
+        sumq2_aux[i / 4] += w * (kmin * kmin);
     }
     if (max < GROUP_MAX_EPS_IQ3_XXS) {
         return 0.0f;
@@ -5244,24 +5317,72 @@ static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgri
     for (int i = 0; i < k_sort->n; ++i) {
         const int ii = k_sort->ids[i];
         const int k_i = k_sort->k_ids[i];
-        const float odd = k_sort->odd[k_i];
-        const float step = k_sort->step[k_i];
-        const float w = weight[ii];
+        // const float odd = k_sort->odd[k_i];
+        // const float step = k_sort->step[k_i];
+        // const float w = weight[ii];
         const int g_i = ii / 4;
-        sumqx += w * (xval[ii] * step);
-        sumq2 += w * (odd * step);
+        // sumqx += w * (xval[ii] * step);
+        // sumq2 += w * (odd * step);
         Laux[ii] = k_i;
 
-        const int grid_index = iq3_find_relative_neighbour(k_sort, kgrid, kmap, kneighbors, xval + 4*g_i, weight + 4*g_i, Laux + 4*g_i, sumqx_aux + g_i, sumq2_aux + g_i);
+        // const float scale_cur = sumq2 > 0.0f ? sumqx / sumq2 : 0.0f;
+        // const int grid_index = iq3_find_relative_neighbour(k_sort, kgrid, kmap, kneighbors, xval + 4*g_i, weight + 4*g_i, Laux + 4*g_i, sumqx_aux + g_i, sumq2_aux + g_i);
+        const int grid_index = iq3_find_relative_neighbour(k_sort, kgrid, kmap, kneighbors, xval + 4*g_i, weight + 4*g_i, Laux + 4*g_i);
 
         if (grid_index == grid_idx_aux[g_i]) { continue; }
         if (grid_index < 0) { break; }
 
+        const float between = iq3_scale_between(kgrid, xval + 4*g_i, weight + 4*g_i, grid_idx_aux[g_i], grid_index);
+        grid_ids[n_grid_id_scale++] = (struct grid_id_scale) {
+            .scale      = between,
+            .grid_index = grid_index,
+            .g_i        = g_i,
+        };
+
         grid_idx_aux[g_i] = grid_index;
 
-        // avoid some subtraction numerical instabilities by having relative sumqx and sumq2 per grid index
-        float sumqx_cur = sumqx;
-        float sumq2_cur = sumq2;
+        // // avoid some subtraction numerical instabilities by having relative sumqx and sumq2 per grid index
+        // float sumqx_cur = sumqx;
+        // float sumq2_cur = sumq2;
+        // for (int j = 0; j < n_idx; ++j) {
+        //     sumqx_cur += sumqx_aux[j];
+        //     sumq2_cur += sumq2_aux[j];
+        // }
+
+        // const float current = sumqx_cur * sumqx_cur;
+        // if (sumq2_cur > 0.0f && current * best_sumq2 > best * sumq2_cur) {
+        //     best = current;
+        //     best_sumqx = sumqx_cur;
+        //     best_sumq2 = sumq2_cur;
+        //     for (int j = 0; j < n_idx; ++j) {
+        //         grid_idx[j] = grid_idx_aux[j];
+        //     }
+        // }
+    }
+    qsort(grid_ids, n_grid_id_scale, sizeof(struct grid_id_scale), grid_id_scale_sort_desc);
+
+    for (int i = 0; i < n_idx; ++i) {
+        grid_idx_aux[i] = 0;
+    }
+
+    for (int i = 0; i < n_grid_id_scale; ++i) {
+        const int grid_index = grid_ids[i].grid_index;
+        const int g_i = grid_ids[i].g_i;
+        const int8_t * Lg = (const int8_t *)(kgrid + grid_index);
+
+        grid_idx_aux[g_i] = grid_index;
+
+        sumqx_aux[g_i] = 0.0f;
+        sumq2_aux[g_i] = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            const float w = weight[4*g_i + k];
+            sumqx_aux[g_i] += w * xval[4*g_i + k] * Lg[k];
+            sumq2_aux[g_i] += w * Lg[k] * Lg[k];
+        }
+
+        // avoid some subtraction numerical instabilities by having sumqx and sumq2 per grid index
+        float sumqx_cur = 0.0f;
+        float sumq2_cur = 0.0f;
         for (int j = 0; j < n_idx; ++j) {
             sumqx_cur += sumqx_aux[j];
             sumq2_cur += sumq2_aux[j];
@@ -5391,7 +5512,7 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 block_signs[k] = s & 127;
             }
 
-            const float scale = make_iq3_quant(32, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quants(32, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
 
             for (int k = 0; k < 8; ++k) {
                 int grid_index = grid_idx[k];
@@ -5525,7 +5646,7 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 }
                 block_signs[k] = s;
             }
-            const float scale = make_iq3_quant(block_size, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quants(block_size, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
             for (int k = 0; k < bs4; ++k) {
                 int grid_index = grid_idx[k];
                 qs[k] = grid_index & 255;
