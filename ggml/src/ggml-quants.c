@@ -4843,8 +4843,10 @@ static void quantize_row_iq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_
                     // the least significant weight has its sign flipped
                     int imin = 0;
                     float min = weight[8*k + imin] * fabsf(xb[8*k + imin]);
+                    // float min = weight[8*k + imin] * xb[8*k + imin] * xb[8*k + imin];
                     for (int i = 1; i < 8; ++i) {
                         float ax = weight[8*k + i] * fabsf(xb[8*k + i]);
+                        // float ax = weight[8*k + i] * xb[8*k + i] * xb[8*k + i];
                         if (ax < min) {
                             min = ax;
                             imin = i;
@@ -4910,12 +4912,13 @@ size_t quantize_iq2_xs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
 typedef struct {
     uint32_t * grid;
     int      * map;
+    int      * neighbours_map;
     uint16_t * neighbours;
 } iq3_entry_t;
 
 static iq3_entry_t iq3_data[2] = {
-    {NULL, NULL, NULL},
-    {NULL, NULL, NULL},
+    {NULL, NULL, NULL, NULL},
+    {NULL, NULL, NULL, NULL},
 };
 
 static inline int iq3_data_index(int grid_size) {
@@ -4993,15 +4996,16 @@ void iq3xs_init_impl(int grid_size) {
     static const int8_t kvalues_iq3xxs[8] = { 0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e };
 
     const int kmap_size = 4096;
-    const int nwant = grid_size == 256 ? 2 : 3;
+    // const int nwant = grid_size == 256 ? 2 : 3;
     const uint16_t * kgrid = grid_size == 256 ? kgrid_256 : kgrid_512;
     const int8_t * kvalues = grid_size == 256 ? kvalues_iq3xxs : kvalues_iq3s;
     uint32_t * kgrid_q3xs;
     int      * kmap_q3xs;
+    int      * kneighbors_map;
     uint16_t * kneighbors_q3xs;
 
     //printf("================================================================= %s(grid_size = %d)\n", __func__, grid_size);
-    kgrid_q3xs = (uint32_t *)malloc(grid_size*sizeof(uint32_t));
+    kgrid_q3xs = (uint32_t *) malloc(grid_size * sizeof(uint32_t));
     for (int k = 0; k < grid_size; ++k) {
         int8_t * pos = (int8_t *)(kgrid_q3xs + k);
         for (int i = 0; i < 4; ++i) {
@@ -5019,73 +5023,148 @@ void iq3xs_init_impl(int grid_size) {
         uint16_t index = kgrid[i];
         kmap_q3xs[index] = i;
     }
-    int8_t pos[4];
+
+    kneighbors_map = (int *) malloc(grid_size * sizeof(int));
+    iq3_data[gindex].neighbours_map = kneighbors_map;
+
+    // int8_t * hidden = (int8_t*)malloc(4*grid_size*sizeof(int8_t));
+    // // TODO: is there a distance metric which is general whatever the relative axis weights?
+    // // No.
+    // // Is there a distance metric where the diagonals weigh as much as the straight lines?
+    // // Yes, it's called max(abs(...)).
+    // //
+    // // I think the hidden points are a combination of multiple hidden hyperplanes.
+    // // How to store that quickly?
+    // // It's like an AND of range conditions?
+    // // nPr? or nCr?
+    // // nCr times the sign?
+
+    // // Each relative point hides other points away from 0 starting from the non-zero coords
+    // // The only exception is when there's a single non-zero coord,
+    // // in which case relative points with equal other coords are not necessarily hidden.
+    // // This is an attempt at getting all possible neighbours regardless of the relative axis weights.
+    // // Or in all cases only non-zero coords greater than are hidden?
+    // // Or only multiples are hidden?
+    // for (int i = 0; i < grid_size; ++i) {
+    //     int8_t p0[4];
+    //     const int8_t * p0g = (const int8_t *)(kgrid_q3xs + i);
+    //     for (int k = 0; k < 4; ++k) { p0[k] = (kgrid[i] >> (3*k)) & 0x07; }
+    //     memset(hidden, 0, grid_size*sizeof(bool));
+    //     for (int j = 0; j < i; ++j) {
+    //         // get known neighbours from previous points?
+    //     }
+    //     for (int j = i + 1; j < grid_size; ++j) {
+    //         // new neighbours
+    //         const int8_t * p1g = (const int8_t *)(kgrid_q3xs + j);
+    //         int8_t p1[4];
+    //         int8_t pdiff[4];
+    //         int n_hidden = 0;
+    //         bool all_neg = true;
+    //         for (int k = 0; k < 4; ++k) {
+    //             p1[k] = (kgrid[j] >> (3*k)) & 0x07;
+    //             pdiff[k] = p1[k] - p0[k];
+    //             // away from zero is fine. going back is not
+    //             // FIXME: handle crossing zero
+    //             if (abs(p1g[k]) > abs(p0g[k])) { all_neg = false; }
+    //         }
+    //         if (all_neg) { continue; }
+
+    //         for (int k = 0; k < 4; ++k) {
+
+    //         }
+    //     }
+    //     for (int j = 0; j < grid_size; ++j) {
+
+    //     }
+    // }
+
     int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
     int num_neighbors = 0;
-    int num_not_in_map = 0;
-    for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q3xs[i] >= 0) { continue; }
-        ++num_not_in_map;
-        for (int k = 0; k < 4; ++k) {
-            int l = (i >> 3*k) & 0x7;
-            pos[k] = kvalues[l];
-        }
+    for (int i = 0; i < grid_size; ++i) {
+        const int8_t * p0 = (const int8_t *)(kgrid_q3xs + i);
+        int num_dist = 0;
         for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+            if (i == j) { continue; }
+            const int8_t * p1 = (const int8_t *)(kgrid_q3xs + j);
+            // TODO: limit going back towards the origin
+            // bool all_neg = true;
+            // for (int k = 0; k < 4; ++k) {
+            //     if (pg[k] - pos[k] > 0) {
+            //         all_neg = false;
+            //         break;
+            //     }
+            // }
+            // if (all_neg) { continue; }
             int d2 = 0;
-            for (int k = 0; k < 4; ++k) { d2 += (pg[k] - pos[k])*(pg[k] - pos[k]); }
-            dist2[2*j+0] = d2;
-            dist2[2*j+1] = j;
+            for (int k = 0; k < 4; ++k) { d2 += (p1[k] - p0[k])*(p1[k] - p0[k]); }
+            dist2[2*(num_dist)+0] = d2;
+            dist2[2*(num_dist)+1] = j;
+            num_dist += 1;
         }
-        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+        qsort(dist2, num_dist, 2*sizeof(int), iq3_compare_func);
         int n = 0; int d2 = dist2[0];
-        int nhave = 1;
-        for (int j = 0; j < grid_size; ++j) {
-            if (dist2[2*j] > d2) {
-                if (nhave == nwant) { break; }
-                d2 = dist2[2*j];
-                ++nhave;
-            }
+        // int nhave = 1;
+        // for (int j = 0; j < num_dist; ++j) {
+        //     if (dist2[2*j] > d2) {
+        //         if (nhave == nwant) { break; }
+        //         d2 = dist2[2*j];
+        //         ++nhave;
+        //     }
+        //     ++n;
+        // }
+        for (int j = 0; j < num_dist; ++j) {
+            if (dist2[2*j] >= 2*d2) { break; }
             ++n;
         }
         num_neighbors += n;
     }
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
-    kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
+    kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + grid_size)*sizeof(uint16_t));
     iq3_data[gindex].neighbours = kneighbors_q3xs;
     int counter = 0;
-    for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q3xs[i] >= 0) { continue; }
-        for (int k = 0; k < 4; ++k) {
-            int l = (i >> 3*k) & 0x7;
-            pos[k] = kvalues[l];
-        }
+    for (int i = 0; i < grid_size; ++i) {
+        const int8_t * p0 = (const int8_t *)(kgrid_q3xs + i);
+        int num_dist = 0;
         for (int j = 0; j < grid_size; ++j) {
-            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+            if (i == j) { continue; }
+            const int8_t * p1 = (const int8_t *)(kgrid_q3xs + j);
+            // bool all_neg = true;
+            // for (int k = 0; k < 4; ++k) {
+            //     if (pg[k] - pos[k] > 0) {
+            //         all_neg = false;
+            //         break;
+            //     }
+            // }
+            // if (all_neg) { continue; }
             int d2 = 0;
-            for (int k = 0; k < 4; ++k) { d2 += (pg[k] - pos[k])*(pg[k] - pos[k]); }
-            dist2[2*j+0] = d2;
-            dist2[2*j+1] = j;
+            for (int k = 0; k < 4; ++k) { d2 += (p1[k] - p0[k])*(p1[k] - p0[k]); }
+            dist2[2*(num_dist)+0] = d2;
+            dist2[2*(num_dist)+1] = j;
+            num_dist += 1;
         }
-        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
-        // TODO: reserve -1?
-        kmap_q3xs[i] = -(counter + 1);
+        qsort(dist2, num_dist, 2*sizeof(int), iq3_compare_func);
+        kneighbors_map[i] = counter;
         int d2 = dist2[0];
         uint16_t * start = &kneighbors_q3xs[counter++];
         int n = 0;
-        int nhave = 1;
-        for (int j = 0; j < grid_size; ++j) {
-            if (dist2[2*j] > d2) {
-                if (nhave == nwant) { break; }
-                d2 = dist2[2*j];
-                ++nhave;
-            }
+        // int nhave = 1;
+        // for (int j = 0; j < num_dist; ++j) {
+        //     if (dist2[2*j] > d2) {
+        //         if (nhave == nwant) { break; }
+        //         d2 = dist2[2*j];
+        //         ++nhave;
+        //     }
+        //     kneighbors_q3xs[counter++] = dist2[2*j+1];
+        //     ++n;
+        // }
+        for (int j = 0; j < num_dist; ++j) {
+            if (dist2[2*j] >= 2*d2) { break; }
             kneighbors_q3xs[counter++] = dist2[2*j+1];
             ++n;
         }
         *start = n;
     }
-    GGML_ASSERT(counter == num_neighbors + num_not_in_map);
+    GGML_ASSERT(counter == num_neighbors + grid_size);
     free(dist2);
 }
 
@@ -5093,9 +5172,10 @@ void iq3xs_free_impl(int grid_size) {
     GGML_ASSERT(grid_size == 256 || grid_size == 512);
     const int gindex = iq3_data_index(grid_size);
     if (iq3_data[gindex].grid) {
-        free(iq3_data[gindex].grid);       iq3_data[gindex].grid = NULL;
-        free(iq3_data[gindex].map);        iq3_data[gindex].map  = NULL;
-        free(iq3_data[gindex].neighbours); iq3_data[gindex].neighbours = NULL;
+        free(iq3_data[gindex].grid);           iq3_data[gindex].grid = NULL;
+        free(iq3_data[gindex].map);            iq3_data[gindex].map  = NULL;
+        free(iq3_data[gindex].neighbours_map); iq3_data[gindex].neighbours_map = NULL;
+        free(iq3_data[gindex].neighbours);     iq3_data[gindex].neighbours     = NULL;
     }
 }
 
@@ -5126,7 +5206,7 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
     float best_d2 = FLT_MAX;
 
     if (grid_index < 0) {
-        const uint16_t * neighbours = kneighbours - (grid_index + 1);
+        const uint16_t * neighbours = kneighbours - (grid_index + 2);
         const int num_neighbours = neighbours[0];
 
         float prev_sumqx = 0.0f;
@@ -5221,6 +5301,55 @@ static float iq3_scale_between(const uint32_t * grid, const float * xval, const 
     return scale;
 }
 
+static int iq3_find_next_point(const uint32_t * kgrid, const int * kneighbours_map, const uint16_t * kneighbours, const float * xval, const float * weight, int current_point, float * scale) {
+
+    const float max_scale = *scale;
+    float best_scale = 0.0f;
+    int best_point = -1;
+
+    const int8_t * p0 = (const int8_t *)(kgrid + current_point);
+
+    float waux[4];
+    for (int k = 0; k < 4; ++k) { waux[k] = sqrtf(weight[k]); }
+
+    const uint16_t * neighbours = kneighbours + kneighbours_map[current_point];
+    const int num_neighbours = neighbours[0];
+
+    for (int i = 1; i <= num_neighbours; ++i) {
+        const int this_point = neighbours[i];
+        if (this_point == current_point) { continue; }
+        const int8_t * p1 = (const int8_t *)(kgrid + this_point);
+        float sumhx = 0.0f;
+        float sumh2 = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            const float x = xval[k];
+            // TODO: figure out why the square root of w is better?
+            // const float w = waux[k];
+            const float w = weight[k];
+            // A point on the target mid-point hyperplane
+            const float h_mid = (p1[k] + p0[k]) / 2.0f;
+            // The direction of the normal vector of the hyperplane
+            // const float h_dir = w * abs(p1[k] - p0[k]);
+            const float h_dir = w * (p1[k] - p0[k]);
+            sumhx += x * h_dir;
+            sumh2 += h_mid * h_dir;
+        }
+
+        const float this_scale = sumh2 > 0.0f ? sumhx / sumh2 : 0.0f;
+        // TODO: should the max be <= ?
+        // if (this_scale <= max_scale && this_scale > best_scale) {
+        if (this_scale > best_scale) {
+            best_point = this_point;
+            best_scale = this_scale;
+        }
+    }
+
+    if (best_point >= 0) {
+        *scale = best_scale;
+    }
+    return best_point;
+}
+
 static int iq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, const uint32_t * GGML_RESTRICT grid,
         const float * GGML_RESTRICT xval, const float * GGML_RESTRICT weight, float scale, int8_t * GGML_RESTRICT L) {
     int num_neighbors = neighbours[0];
@@ -5261,7 +5390,7 @@ static int grid_id_scale_sort_desc(const void * left, const void * right) {
     return l->scale > r->scale ? -1 : 1;
 }
 
-static float make_iq3_quants(int n, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const uint16_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
+static float make_iq3_quants(int n, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const int * kneighbors_map, const uint16_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
     GGML_ASSERT(n % 4 == 0);
     const int n_idx = n / 4;
 
@@ -5314,6 +5443,23 @@ static float make_iq3_quants(int n, struct k_sort * k_sort, const uint32_t * kgr
         best_sumqx = 0.0f;
         best_sumq2 = 1.0f;
     }
+    for (int g_i = 0; g_i < n_idx; ++g_i) {
+        int grid_index = kmap[0];
+        float scale = FLT_MAX;
+
+        while (grid_index >= 0) {
+            grid_index = iq3_find_next_point(kgrid, kneighbors_map, kneighbors, xval + 4*g_i, weight + 4*g_i, grid_index, &scale);
+            if (grid_index >= 0) {
+                grid_ids[n_grid_id_scale++] = (struct grid_id_scale){
+                    .scale = scale,
+                    .grid_index = grid_index,
+                    .g_i = g_i,
+                };
+            }
+            GGML_ASSERT(n_grid_id_scale <= 32*8);
+        }
+    }
+    /*
     for (int i = 0; i < k_sort->n; ++i) {
         const int ii = k_sort->ids[i];
         const int k_i = k_sort->k_ids[i];
@@ -5359,6 +5505,7 @@ static float make_iq3_quants(int n, struct k_sort * k_sort, const uint32_t * kgr
         //     }
         // }
     }
+    */
     qsort(grid_ids, n_grid_id_scale, sizeof(struct grid_id_scale), grid_id_scale_sort_desc);
 
     for (int i = 0; i < n_idx; ++i) {
@@ -5409,11 +5556,13 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
 
     const uint32_t * kgrid_q3xs      = iq3_data[gindex].grid;
     const int      * kmap_q3xs       = iq3_data[gindex].map;
+    const int      * knmap_q3xs      = iq3_data[gindex].neighbours_map;
     const uint16_t * kneighbors_q3xs = iq3_data[gindex].neighbours;
 
     //GGML_ASSERT(quant_weights   && "missing quantization weights");
     GGML_ASSERT(kgrid_q3xs      && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(kmap_q3xs       && "forgot to call ggml_quantize_init()?");
+    GGML_ASSERT(knmap_q3xs      && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(kneighbors_q3xs && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(n%QK_K == 0);
 
@@ -5512,7 +5661,7 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 block_signs[k] = s & 127;
             }
 
-            const float scale = make_iq3_quants(32, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quants(32, &k_sort, kgrid_q3xs, kmap_q3xs, knmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
 
             for (int k = 0; k < 8; ++k) {
                 int grid_index = grid_idx[k];
@@ -5561,11 +5710,13 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
 
     const uint32_t * kgrid_q3xs      = iq3_data[gindex].grid;
     const int      * kmap_q3xs       = iq3_data[gindex].map;
+    const int      * knmap_q3xs      = iq3_data[gindex].neighbours_map;
     const uint16_t * kneighbors_q3xs = iq3_data[gindex].neighbours;
 
     //GGML_ASSERT(quant_weights   && "missing quantization weights");
     GGML_ASSERT(kgrid_q3xs      && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(kmap_q3xs       && "forgot to call ggml_quantize_init()?");
+    GGML_ASSERT(knmap_q3xs      && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(kneighbors_q3xs && "forgot to call ggml_quantize_init()?");
     GGML_ASSERT(n%QK_K == 0);
 
@@ -5646,7 +5797,7 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 }
                 block_signs[k] = s;
             }
-            const float scale = make_iq3_quants(block_size, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quants(block_size, &k_sort, kgrid_q3xs, kmap_q3xs, knmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
             for (int k = 0; k < bs4; ++k) {
                 int grid_index = grid_idx[k];
                 qs[k] = grid_index & 255;
