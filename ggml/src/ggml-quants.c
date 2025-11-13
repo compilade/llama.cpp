@@ -4913,6 +4913,19 @@ typedef struct {
     uint16_t * neighbours;
 } iq3_entry_t;
 
+// IDEA: sort by scale and prune by distance
+// then find boundaries and merge sort that with the other block subsets
+// then compare for every candidate scale
+typedef struct {
+    float scale; // sumqx / sumq2
+    // FIXME: is this really the correct formula???
+    float d2; // diff2 = d2 + sumq2*(new_scale - scale)**2
+    float sumqx;
+    float sumq2;
+    int16_t index;
+    int16_t g_i;
+} iqx_diff_t;
+
 static iq3_entry_t iq3_data[2] = {
     {NULL, NULL, NULL},
     {NULL, NULL, NULL},
@@ -4928,6 +4941,14 @@ static int iq3_compare_func(const void * left, const void * right) {
     const int * l = (const int *)left;
     const int * r = (const int *)right;
     return l[0] < r[0] ? -1 : l[0] > r[0] ? 1 : l[1] < r[1] ? -1 : l[1] > r[1] ? 1 : 0;
+}
+
+static int iqx_diff_scale_compare_asc(const void * left, const void * right) {
+    const float l = ((const iqx_diff_t *) left)->scale;
+    const float r = ((const iqx_diff_t *) right)->scale;
+
+    if (l == r) { return 0; }
+    return l < r ? -1 : 1;
 }
 
 void iq3xs_init_impl(int grid_size) {
@@ -5068,7 +5089,6 @@ void iq3xs_init_impl(int grid_size) {
             dist2[2*j+1] = j;
         }
         qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
-        // TODO: reserve -1?
         kmap_q3xs[i] = -(counter + 1);
         int d2 = dist2[0];
         uint16_t * start = &kneighbors_q3xs[counter++];
@@ -5099,8 +5119,153 @@ void iq3xs_free_impl(int grid_size) {
     }
 }
 
+// Populate a single neighbour
+static void iq3_populate_neighbour(iqx_diff_t *   all_neighbours,
+                                   const int8_t * pg,
+                                   const float *  xval,
+                                   const float *  weight,
+                                   const int      grid_index,
+                                   const int      g_i) {
+    if (all_neighbours[grid_index].index < 0) {
+        float sumqx = 0.0f;
+        float sumq2 = 0.0f;
+        float d2 = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            sumqx += weight[i] * xval[i] * pg[i];
+            sumq2 += weight[i] * pg[i] * pg[i];
+        }
+        const float scale = sumq2 > 0.0f ? sumqx / sumq2 : 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            const float d = pg[i] * scale - xval[i];
+            d2 += weight[i] * (d * d);
+        }
+        all_neighbours[grid_index] = (iqx_diff_t) {
+            .scale = scale,
+            .d2    = d2,
+            .sumqx = sumqx,
+            .sumq2 = sumq2,
+            .index = grid_index,
+            .g_i   = g_i,
+        };
+    }
+}
+
+// Populate all the neighbours of a point
+static void iq3_find_neighbours(      iqx_diff_t * GGML_RESTRICT all_neighbours,
+                                const uint32_t   * GGML_RESTRICT kgrid,
+                                const int        * GGML_RESTRICT kmap,
+                                const uint16_t   * GGML_RESTRICT kneighbours,
+                                const float      * GGML_RESTRICT xval,
+                                const float      * GGML_RESTRICT weight,
+                                const int8_t     * GGML_RESTRICT L,
+                                const int                        g_i) {
+    int u = 0;
+    for (int k = 0; k < 4; ++k) {
+        u |= ((int) L[k] & 7) << (3 * k);
+    }
+    int grid_index = kmap[u];
+    if (grid_index < 0) {
+        const uint16_t * neighbours = kneighbours - (grid_index + 1);
+        const uint16_t num_neighbours = neighbours[0];
+
+        for (int i = 1; i <= num_neighbours; ++i) {
+            grid_index = neighbours[i];
+            // fprintf(stderr, "(%i)", grid_index);
+            const int8_t * pg = (const int8_t *) (kgrid + grid_index);
+            iq3_populate_neighbour(all_neighbours, pg, xval, weight, grid_index, g_i);
+        }
+    } else {
+        const int8_t * pg = (const int8_t *) (kgrid + grid_index);
+        iq3_populate_neighbour(all_neighbours, pg, xval, weight, grid_index, g_i);
+    }
+}
+
+// sort and prune
+// returns the total number of neighbours
+static int iqx_sort_neighbours(iqx_diff_t * all_neighbours, int grid_size, int n_idx) {
+    int cur = 0;
+    int cur_size = 0;
+    // gather neighbours into contiguous chunks
+    for (int i = 0; i < n_idx; ++i) {
+        // gather
+        for (int j = 0; j < grid_size; ++j) {
+            const int k = i*grid_size + j;
+            // ignore zero and negative scales
+            if (all_neighbours[k].index > 0) {
+                if (k != cur + cur_size) {
+                    all_neighbours[cur + cur_size] = all_neighbours[k];
+                }
+                cur_size += 1;
+            }
+        }
+        // sort by scale
+        qsort(all_neighbours + cur, cur_size, sizeof(iqx_diff_t), iqx_diff_scale_compare_asc);
+
+        // prune by distances
+        if (cur_size > 1) {
+            int new_size = 1;
+            for (int j = 1; j < cur_size; j++) {
+                const iqx_diff_t * best = all_neighbours + (cur + j - 1);
+                const iqx_diff_t * worst = all_neighbours + (cur + j);
+
+                if (worst->d2 < best->d2) {
+                    const iqx_diff_t * tmp;
+                    tmp = best;
+                    best = worst;
+                    worst = tmp;
+                }
+
+                const float scale_diff = best->scale - worst->scale;
+                const float scale_diff2 = scale_diff * scale_diff;
+
+                const float diff2 = best->d2 + best->sumq2*scale_diff2;
+                if (diff2 < worst->d2) {
+                    // prune worst
+                    if (best != all_neighbours + cur + new_size - 1) {
+                        all_neighbours[cur + new_size - 1] = *best;
+                    }
+                } else {
+                    // keep both
+                    // TODO: reduce copies
+                    if (j != new_size) {
+                        all_neighbours[cur + new_size - 1] = all_neighbours[cur + j - 1];
+                        all_neighbours[cur + new_size] = all_neighbours[cur + j];
+                    }
+                    new_size += 1;
+                }
+            }
+            cur_size = new_size;
+        }
+        // FIXME: debug the above
+
+        // calculate scale thresholds
+        if (cur_size > 0) {
+            // NOTE: the 0th scale is unchanged
+            for (int j = 1; j < cur_size; j++) {
+                // find the midscale where the distance of both points would be equal
+                const float mid_sumqx = all_neighbours[cur + j - 1].sumqx + all_neighbours[cur + j].sumqx;
+                const float mid_sumq2 = all_neighbours[cur + j - 1].sumq2 + all_neighbours[cur + j].sumq2;
+                const float mid_scale = mid_sumq2 > 0.0f ? mid_sumqx / mid_sumq2 : 0;
+                all_neighbours[cur + j].scale = mid_scale;
+            }
+        }
+
+        cur += cur_size;
+        cur_size = 0;
+    }
+
+    // sort everything together by scale thresholds
+    qsort(all_neighbours, cur, sizeof(iqx_diff_t), iqx_diff_scale_compare_asc);
+
+    return cur;
+}
+
 // returns grid_index
 // and stores relative sumqx and sumq2 in the respective arguments
+// FIXME: need to enumerate the transition scales for each neighbour of L?
+//        this needs to depend on the quant_weights,
+//        because of the shape of the grid cells.
+// FIXME: Need to
 static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sort,
                                        const uint32_t      * GGML_RESTRICT kgrid,
                                        const int           * GGML_RESTRICT kmap,
@@ -5128,6 +5293,11 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
         const uint16_t * neighbours = kneighbours - (grid_index + 1);
         const int num_neighbours = neighbours[0];
 
+        // FIXME: what *should* prev_scale be?
+        // around what point should the point distances be measured?
+        // Why not use the cosine similarity?
+        // (because the scale is relevant, due to this being a subset of a block)
+        // But why not
         float prev_sumqx = 0.0f;
         float prev_sumq2 = 0.0f;
         float waux[8];
@@ -5143,6 +5313,8 @@ static int iq3_find_relative_neighbour(const struct k_sort * GGML_RESTRICT k_sor
             float d2 = 0.0f;
             for (int k = 0; k < 4; ++k) {
                 const float diff = prev_scale * pg[k] - xval[k];
+                // FIXME: keep track of when the diff would need a bigger scale?
+                const float zero_scale = xval[k] / pg[k];
                 d2 += waux[k] * diff * diff;
             }
 
@@ -5191,6 +5363,98 @@ static int iq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, co
     const int8_t * pg = (const int8_t *)(grid + grid_index);
     for (int i = 0; i < 4; ++i) L[i] = (pg[i] - 1)/2;
     return grid_index;
+}
+
+static float make_iq3_quants(int n, int grid_size, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const uint16_t * kneighbours, const float * xval, const float * weight, int8_t * Laux, iqx_diff_t * all_neighbours, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
+    GGML_ASSERT(n % 4 == 0);
+    const int n_idx = n / 4;
+
+    for (int i = 0; i < n_idx; ++i) {
+        sumqx_aux[i] = 0.0f;
+        sumq2_aux[i] = 0.0f;
+        grid_idx_aux[i] = 0;
+        grid_idx[i] = 0;
+    }
+    // make all .index fields negative
+    memset(all_neighbours, -1, sizeof(iqx_diff_t)*n_idx*grid_size);
+
+    float sumqx = 0.0f;
+    float sumq2 = 0.0f;
+    float max = 0.0f;
+    float w_amax = -1.0f;
+    int w_amax_i = -1;
+    const float kmin = k_sort->kmin;
+    for (int i = 0; i < n; ++i) {
+        const float x = xval[i];
+        const float w = weight[i];
+        const float w_ax = fabsf(x) * w;
+        max = MAX(x, max);
+        if (w_ax > w_amax) {
+            w_amax = w_ax;
+            w_amax_i = i;
+        }
+        sumqx_aux[i / 4] += w * (x * kmin);
+        sumqx_aux[i / 4] += w * (kmin * kmin);
+        Laux[i] = k_sort->mid_k;
+        sumqx += w * (x * kmin);
+        sumq2 += w * (kmin * kmin);
+    }
+    if (max < GROUP_MAX_EPS_IQ3_XXS) {
+        return 0.0f;
+    }
+
+    k_sort_set_x_L(k_sort, n, w_amax_i, xval, Laux, false);
+
+    float best;
+    float best_sumqx;
+    float best_sumq2;
+    if (sumq2 > 0.0f) {
+        best = sumqx * sumqx;
+        best_sumqx = sumqx;
+        best_sumq2 = sumq2;
+    } else {
+        best = 0.0f;
+        best_sumqx = 0.0f;
+        best_sumq2 = 1.0f;
+    }
+    for (int i = 0; i < k_sort->n; ++i) {
+        const int ii = k_sort->ids[i];
+        const int k_i = k_sort->k_ids[i];
+        const float odd = k_sort->odd[k_i];
+        const float step = k_sort->step[k_i];
+        const float w = weight[ii];
+        const int g_i = ii / 4;
+        sumqx += w * (xval[ii] * step);
+        sumq2 += w * (odd * step);
+        Laux[ii] = k_i;
+
+        iq3_find_neighbours(all_neighbours + grid_size * g_i, kgrid, kmap, kneighbours, xval + 4*g_i, weight + 4*g_i, Laux + 4*g_i, g_i);
+    }
+    const int num_neighbours = iqx_sort_neighbours(all_neighbours, grid_size, n_idx);
+    for (int i = 0; i < num_neighbours; ++i) {
+        const int g_i = all_neighbours[i].g_i;
+        sumqx_aux[g_i] = all_neighbours[i].sumqx;
+        sumq2_aux[g_i] = all_neighbours[i].sumq2;
+        grid_idx_aux[g_i] = all_neighbours[i].index;
+
+        float total_sumqx = 0.0f;
+        float total_sumq2 = 0.0f;
+        for (int k = 0; k < n_idx; ++k) {
+            total_sumqx += sumqx_aux[k];
+            total_sumq2 += sumq2_aux[k];
+        }
+
+        const float current = total_sumqx * total_sumqx;
+        if (total_sumq2 > 0.0f && current * best_sumq2 > best * total_sumq2) {
+            best = current;
+            best_sumqx = total_sumqx;
+            best_sumq2 = total_sumq2;
+            for (int k = 0; k < n_idx; ++k) {
+                grid_idx[k] = grid_idx_aux[k];
+            }
+        }
+    }
+    return best_sumq2 > 0.0f ? best_sumqx / best_sumq2 : 0.0f;
 }
 
 static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgrid, const int * kmap, const uint16_t * kneighbors, const float * xval, const float * weight, int8_t * Laux, float * sumqx_aux, float * sumq2_aux, int * grid_idx_aux, int * grid_idx) {
@@ -5278,6 +5542,8 @@ static float make_iq3_quant(int n, struct k_sort * k_sort, const uint32_t * kgri
         }
     }
 
+    // FIXME:
+
     return best_sumq2 > 0.0f ? best_sumqx / best_sumq2 : 0.0f;
 }
 
@@ -5319,6 +5585,7 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
     int grid_idx_aux[8];
     float sumqx_aux[8];
     float sumq2_aux[8];
+    iqx_diff_t all_neighbours[256 * 8];
     uint8_t block_signs[8];
     uint8_t q3[3*(QK_K/8)+QK_K/32];
     uint32_t * scales_and_signs = (uint32_t *)(q3 + QK_K/4);
@@ -5391,7 +5658,7 @@ static void quantize_row_iq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 block_signs[k] = s & 127;
             }
 
-            const float scale = make_iq3_quant(32, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quants(32, 256, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, all_neighbours, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
 
             for (int k = 0; k < 8; ++k) {
                 int grid_index = grid_idx[k];
@@ -5470,6 +5737,7 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
     int grid_idx_aux[IQ3S_BLOCK_SIZE/4];
     float sumqx_aux[IQ3S_BLOCK_SIZE/4];
     float sumq2_aux[IQ3S_BLOCK_SIZE/4];
+    iqx_diff_t all_neighbours[512 * IQ3S_BLOCK_SIZE/4];
     uint8_t block_signs[IQ3S_BLOCK_SIZE/8];
     struct k_sort k_sort;
     uint8_t buf[K_SORT_BUF_SIZE_NL(IQ3S_BLOCK_SIZE, 8, 7)];
@@ -5525,7 +5793,7 @@ static void quantize_row_iq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 }
                 block_signs[k] = s;
             }
-            const float scale = make_iq3_quant(block_size, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
+            const float scale = make_iq3_quants(block_size, 512, &k_sort, kgrid_q3xs, kmap_q3xs, kneighbors_q3xs, xval, weight, Laux, all_neighbours, sumqx_aux, sumq2_aux, grid_idx_aux, grid_idx);
             for (int k = 0; k < bs4; ++k) {
                 int grid_index = grid_idx[k];
                 qs[k] = grid_index & 255;
